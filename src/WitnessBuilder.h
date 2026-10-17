@@ -4,7 +4,7 @@
 #include "Settings.h"
 
 extern "C" {
-#include "aiger.h"
+#include "aiger/aiger.h"
 }
 
 #include <memory>

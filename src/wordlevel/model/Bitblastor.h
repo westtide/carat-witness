@@ -5,7 +5,7 @@
 #include "WLTrace.h"
 
 extern "C" {
-#include "aiger.h"
+#include "aiger/aiger.h"
 }
 
 #include <boolector/boolector.h>

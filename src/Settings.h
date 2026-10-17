@@ -83,6 +83,12 @@ struct Settings {
     bool searchFromBadPred = false;
     bool shrinkInvariant = false;
     bool detailedTimers = false;
+
+    // Live profiler (docs/profiler_protocol.md). Profiling is on when either
+    // traceSocket or traceFile is non-empty.
+    std::string traceSocket = "";
+    std::string traceFile = "";
+    std::string traceLevel = "summary";
 };
 
 bool ParseSettings(int argc, char **argv, Settings &settings);

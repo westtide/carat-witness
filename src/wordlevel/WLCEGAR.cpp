@@ -8,6 +8,7 @@
 #include "WLSimulator.h"
 #include "model/Bitblastor.h"
 #include "model/PackageResize.h"
+#include "profiler/Profiler.h"
 
 #include <algorithm>
 #include <chrono>
@@ -46,17 +47,33 @@ std::unique_ptr<WLCEGAR::AbstractionContext> WLCEGAR::BuildAbstractionContext(
     auto context = std::make_unique<AbstractionContext>(m_abstraction.Build(precision));
     if (context->build.IR().HasArrays())
         throw std::runtime_error("array abstraction produced an array-valued word-level model");
-    if (!m_settings.wlDisablePackageResize)
-        context->resize = std::make_unique<PackageResize>(context->build.IR());
+    {
+        prof::ScopedSpan resize_span(prof::Stage::MODEL_PACKAGE_RESIZE);
+        if (!m_settings.wlDisablePackageResize)
+            context->resize = std::make_unique<PackageResize>(context->build.IR());
+    }
     const auto &bitblastIR = context->resize ? context->resize->IR() : context->build.IR();
-    auto aig = GenerateWLAig(bitblastIR, context->layout);
-    context->model = std::make_unique<Model>(m_settings, m_log, std::move(aig));
+    {
+        prof::ScopedSpan bitblast_span(prof::Stage::MODEL_BITBLAST);
+        auto aig = GenerateWLAig(bitblastIR, context->layout);
+        prof::ModelStat(prof::MSTAT_AIG_INPUTS, aig->num_inputs);
+        prof::ModelStat(prof::MSTAT_AIG_LATCHES, aig->num_latches);
+        prof::ModelStat(prof::MSTAT_AIG_ANDS, aig->num_ands);
+        prof::ModelStat(prof::MSTAT_ARRAY_SELECTORS,
+                        m_abstraction.SelectorCount(context->build));
+        prof::ModelStat(prof::MSTAT_ARRAY_SLOTS,
+                        m_abstraction.SlotCount(context->build));
+        context->model = std::make_unique<Model>(m_settings, m_log, std::move(aig));
+    }
     LOG_L(m_log, 1, "word-level model build: ms=",
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
           " selectors=", m_abstraction.SelectorCount(context->build),
           " slots=", m_abstraction.SlotCount(context->build));
-    context->checker = CreateBitLevelChecker(m_settings, *context->model, m_log);
-    if (!context->checker) throw std::runtime_error("word-level CEGAR requires a bit-level checker.");
+    {
+        prof::ScopedSpan checker_span(prof::Stage::MODEL_INIT_CHECKER);
+        context->checker = CreateBitLevelChecker(m_settings, *context->model, m_log);
+        if (!context->checker) throw std::runtime_error("word-level CEGAR requires a bit-level checker.");
+    }
     return context;
 }
 
@@ -94,6 +111,7 @@ bool WLCEGAR::ReloadModel(const std::vector<ArrayAbstraction::TrackingTarget> &t
 CheckResult WLCEGAR::Run() {
     CheckResult res = CheckResult::Unknown;
     unsigned refinements = 0;
+    unsigned cegar_round = 0;
     m_trace = {};
 
     const auto confirm = [&](WLTrace candidate) {
@@ -113,15 +131,21 @@ CheckResult WLCEGAR::Run() {
     };
     while (true) {
         // Each iteration proves or refutes the current finite abstraction.
+        prof::ScopedSpan round_span(prof::Stage::CEGAR_ROUND, cegar_round);
         if (!m_abstractionContext->checker) return CheckResult::Unknown;
         const auto checkerStart = std::chrono::steady_clock::now();
-        res = m_abstractionContext->checker->Run();
+        {
+            prof::ScopedSpan check_span(prof::Stage::CEGAR_CHECK, cegar_round);
+            res = m_abstractionContext->checker->Run();
+        }
         LOG_L(m_log, 1, "word-level checker: ms=", elapsed(checkerStart));
 
         if (res == CheckResult::Unsafe) {
             // Recover the current abstract AIG choices for unified IR simulation.
             // Only a verified concrete SourceIR trace is Unsafe.
             try {
+                prof::ScopedSpan analyze_span(prof::Stage::CEGAR_CEX_ANALYZE,
+                                              cegar_round);
                 auto trace = m_abstractionContext->checker->GetCexTrace();
                 auto simulationStart = std::chrono::steady_clock::now();
                 auto choices = RecoverChoices(trace);
@@ -136,7 +160,11 @@ CheckResult WLCEGAR::Run() {
                     LOG_L(m_log, 0, "word-level greedy Unknown: ", analysis.reason);
                     return CheckResult::Unknown;
                 }
-                if (!ReloadModel(analysis.targets)) return CheckResult::Unknown;
+                {
+                    prof::ScopedSpan refine_span(prof::Stage::CEGAR_REFINE,
+                                                 cegar_round);
+                    if (!ReloadModel(analysis.targets)) return CheckResult::Unknown;
+                }
                 ++refinements;
                 LOG_L(m_log, 1, "word-level array refinement ", refinements,
                       " targets=", analysis.targets.size(),
@@ -146,6 +174,7 @@ CheckResult WLCEGAR::Run() {
                 LOG_L(m_log, 0, "word-level simulation/analysis Unknown: ", error.what());
                 return CheckResult::Unknown;
             }
+            ++cegar_round;
             continue;
         }
 
@@ -157,7 +186,12 @@ CheckResult WLCEGAR::Run() {
             try {
                 LOG_L(m_log, 1, "word-level guard prefix check through ", delay - 1);
                 const auto prefixStart = std::chrono::steady_clock::now();
-                const auto bounded = boundedChecker.CheckThrough(delay - 1, delay);
+                decltype(boundedChecker.CheckThrough(0, 0)) bounded;
+                {
+                    prof::ScopedSpan prefix_span(prof::Stage::CEGAR_PREFIX_BMC,
+                                                 cegar_round);
+                    bounded = boundedChecker.CheckThrough(delay - 1, delay);
+                }
                 LOG_L(m_log, 1, "word-level guard prefix: ms=", elapsed(prefixStart));
                 if (bounded.status == MemoryBMC::Status::Counterexample) {
                     m_trace = boundedChecker.GetTrace();

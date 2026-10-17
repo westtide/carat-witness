@@ -1,4 +1,5 @@
 #include "KIND.h"
+#include "profiler/Profiler.h"
 
 #include <algorithm>
 #include <csignal>
@@ -86,29 +87,51 @@ void KIND::InitIndSolver() {
 CheckResult KIND::Check() {
     [[maybe_unused]] auto check_scope = m_log.Section("KIND_Check");
     m_useUnrollingCache = false;
-    InitBaseSolver();
-    InitIndSolver();
+    {
+        prof::ScopedSpan init_span(prof::Stage::KIND_INIT);
+        InitBaseSolver();
+        InitIndSolver();
+    }
 
     while (true) {
         LOG_L(m_log, 1, "KIND Bound: ", m_k);
+        prof::IterationBegin(static_cast<uint32_t>(m_k));
+        {
+            prof::ScopedSpan unroll_span(prof::Stage::KIND_UNROLL,
+                                         static_cast<uint32_t>(m_k));
+            AdvanceBaseToNextK();
+            AdvanceIndSolverToNextK();
+        }
 
-        AdvanceBaseToNextK();
-        AdvanceIndSolverToNextK();
-
-        if (CheckBaseCase()) {
+        bool cex = false;
+        {
+            prof::ScopedSpan base_span(prof::Stage::KIND_BASE,
+                                       static_cast<uint32_t>(m_k));
+            cex = CheckBaseCase();
+        }
+        if (cex) {
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, true);
             return CheckResult::Unsafe;
         }
 
-        bool ind_safe = CheckInductiveStep();
+        bool ind_safe = false;
+        {
+            prof::ScopedSpan ind_span(prof::Stage::KIND_IND,
+                                      static_cast<uint32_t>(m_k));
+            ind_safe = CheckInductiveStep();
+        }
         if (ind_safe) {
             m_safeK = std::max(1, m_k);
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, true);
             return CheckResult::Safe;
         }
 
         if (m_maxK != -1 && m_k >= m_maxK) {
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, false);
             return CheckResult::Unknown;
         }
 
+        prof::IterationEnd(static_cast<uint32_t>(m_k), 0, false);
         ++m_k;
     }
 }
@@ -119,29 +142,48 @@ CheckResult KIND::CheckNonIncremental() {
 
     while (true) {
         LOG_L(m_log, 1, "KIND Bound: ", m_k);
+        prof::IterationBegin(static_cast<uint32_t>(m_k));
 
-        if (CheckBaseCaseNonIncremental(m_k)) {
+        bool cex = false;
+        {
+            prof::ScopedSpan base_span(prof::Stage::KIND_BASE,
+                                       static_cast<uint32_t>(m_k));
+            cex = CheckBaseCaseNonIncremental(m_k);
+        }
+        if (cex) {
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, true);
             return CheckResult::Unsafe;
         }
 
-        bool ind_safe = CheckInductiveStepNonIncremental(m_k);
+        bool ind_safe = false;
+        {
+            prof::ScopedSpan ind_span(prof::Stage::KIND_IND,
+                                      static_cast<uint32_t>(m_k));
+            ind_safe = CheckInductiveStepNonIncremental(m_k);
+        }
         if (ind_safe) {
             m_safeK = std::max(1, m_k);
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, true);
             return CheckResult::Safe;
         }
 
         if (m_maxK != -1 && m_k >= m_maxK) {
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, false);
             return CheckResult::Unknown;
         }
 
+        prof::IterationEnd(static_cast<uint32_t>(m_k), 0, false);
         ++m_k;
     }
 }
 
 bool KIND::CheckBaseCase() {
     [[maybe_unused]] auto base_scope = m_log.Section("KIND_Base");
-    AddConstraintsK(m_baseSolver, m_k);
-
+    {
+        prof::ScopedSpan unroll_span(prof::Stage::KIND_UNROLL,
+                                     static_cast<uint32_t>(m_k));
+        AddConstraintsK(m_baseSolver, m_k);
+    }
     Lit k_bad = GetBadK(m_k);
     LOG_L(m_log, 3, "Assumption: ", ToSigned(k_bad));
     bool sat = m_baseSolver->Solve(Cube{k_bad});
@@ -157,8 +199,11 @@ bool KIND::CheckBaseCase() {
 
 bool KIND::CheckInductiveStep() {
     [[maybe_unused]] auto ind_scope = m_log.Section("KIND_Ind");
-    AddConstraintsK(m_indSolver, m_k);
-
+    {
+        prof::ScopedSpan unroll_span(prof::Stage::KIND_UNROLL,
+                                     static_cast<uint32_t>(m_k));
+        AddConstraintsK(m_indSolver, m_k);
+    }
     Lit k_bad = GetBadK(m_k);
     LOG_L(m_log, 3, "Assumption: ", ToSigned(k_bad));
     bool sat = m_indSolver->Solve(Cube{k_bad});
@@ -167,10 +212,13 @@ bool KIND::CheckInductiveStep() {
     }
 
     if (m_settings.witnessOutputDir.empty()) {
+        prof::ScopedSpan sp_span(prof::Stage::KIND_SIMPLEPATH,
+                                 static_cast<uint32_t>(m_k));
         std::vector<StatePairKey> equal_pairs = FindEqualStatePairs(m_indSolver, m_k);
         LOG_L(m_log, 2, "Inductive step SAT, equal state pairs found: ", equal_pairs.size());
         if (!equal_pairs.empty()) {
             AddStateDisequalities(m_indSolver, equal_pairs);
+            prof::Bump(prof::CTR_KIND_SP_PAIRS, equal_pairs.size());
             LOG_L(m_log, 2, "Added lazy simple-path constraints: ", equal_pairs.size());
         }
     } else {
@@ -184,16 +232,20 @@ bool KIND::CheckInductiveStep() {
 
 bool KIND::CheckBaseCaseNonIncremental(int k) {
     [[maybe_unused]] auto base_scope = m_log.Section("KIND_BaseNonInc");
-    auto solver = std::make_shared<SATSolver>(m_model, m_settings.solver);
-    AddInitial(solver);
-    for (int i = 0; i <= k; ++i) {
-        AddClausesK(solver, i);
+    std::shared_ptr<SATSolver> solver;
+    {
+        prof::ScopedSpan build_span(prof::Stage::KIND_UNROLL,
+                                    static_cast<uint32_t>(k));
+        solver = std::make_shared<SATSolver>(m_model, m_settings.solver);
+        AddInitial(solver);
+        for (int i = 0; i <= k; ++i) {
+            AddClausesK(solver, i);
+        }
+        for (int i = 0; i <= k; ++i) {
+            AddConstraintsK(solver, i);
+        }
+        solver->AddClause({GetBadK(k)});
     }
-    for (int i = 0; i <= k; ++i) {
-        AddConstraintsK(solver, i);
-    }
-    solver->AddClause({GetBadK(k)});
-
     bool sat = solver->Solve();
     if (sat) {
         m_cexSolver = solver;
@@ -203,18 +255,23 @@ bool KIND::CheckBaseCaseNonIncremental(int k) {
 
 bool KIND::CheckInductiveStepNonIncremental(int k) {
     [[maybe_unused]] auto ind_scope = m_log.Section("KIND_IndNonInc");
-    auto solver = std::make_shared<SATSolver>(m_model, m_settings.solver);
-    for (int i = 0; i <= k; ++i) {
-        AddClausesK(solver, i);
+    std::shared_ptr<SATSolver> solver;
+    {
+        prof::ScopedSpan build_span(prof::Stage::KIND_UNROLL,
+                                    static_cast<uint32_t>(k));
+        solver = std::make_shared<SATSolver>(m_model, m_settings.solver);
+        for (int i = 0; i <= k; ++i) {
+            AddClausesK(solver, i);
+        }
+        for (int i = 0; i <= k; ++i) {
+            AddConstraintsK(solver, i);
+        }
+        for (int i = 0; i < k; ++i) {
+            solver->AddClause({~GetBadK(i)});
+        }
+        solver->AddClause({GetBadK(k)});
+        ReplayBlockedPairsNonIncremental(solver, k);
     }
-    for (int i = 0; i <= k; ++i) {
-        AddConstraintsK(solver, i);
-    }
-    for (int i = 0; i < k; ++i) {
-        solver->AddClause({~GetBadK(i)});
-    }
-    solver->AddClause({GetBadK(k)});
-    ReplayBlockedPairsNonIncremental(solver, k);
 
     bool sat = solver->Solve();
     if (!sat) {
@@ -222,6 +279,8 @@ bool KIND::CheckInductiveStepNonIncremental(int k) {
     }
 
     if (m_settings.witnessOutputDir.empty()) {
+        prof::ScopedSpan sp_span(prof::Stage::KIND_SIMPLEPATH,
+                                 static_cast<uint32_t>(k));
         std::vector<StatePairKey> equal_pairs = FindEqualStatePairs(solver, k);
         std::vector<StatePairKey> new_pairs;
         new_pairs.reserve(equal_pairs.size());
@@ -230,6 +289,7 @@ bool KIND::CheckInductiveStepNonIncremental(int k) {
                 new_pairs.push_back(pair);
             }
         }
+        prof::Bump(prof::CTR_KIND_SP_PAIRS, equal_pairs.size());
 
         LOG_L(m_log, 2, "Non-incremental inductive step SAT, equal state pairs found: ", equal_pairs.size());
         if (!new_pairs.empty()) {

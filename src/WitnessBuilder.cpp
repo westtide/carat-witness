@@ -4,6 +4,8 @@
 #include "Log.h"
 #include "Model.h"
 #include "WLTrace.h"
+#include "WLSimulator.h"
+#include "ObservationSidecar.h"
 #include "model/WLModel.h"
 
 #include <algorithm>
@@ -227,51 +229,19 @@ bool WitnessBuilder::WriteBtor2Counterexample(
         LOG_L(m_log, 1, "WitnessBuilder: BTOR2 counterexample needs a word-level model.");
         return false;
     }
-    // Array traces are retained for internal verification, not file export.
-    if (m_wlModel->SourceHasArrays()) {
-        LOG_L(m_log, 1, "WitnessBuilder: witness export for BTOR2 models with arrays is unsupported.");
-        return false;
-    }
     if (trace.steps.empty()) {
         LOG_L(m_log, 1, "WitnessBuilder: counterexample trace is empty.");
         return false;
     }
 
-    const Btor2IR &ir = m_wlModel->SourceIR();
-    std::vector<int64_t> states;
-    std::vector<int64_t> inputs;
-    for (const Btor2IRNode &node : ir.Nodes()) {
-        if (node.tag == BTOR2_TAG_state)
-            states.push_back(node.id);
-        else if (node.tag == BTOR2_TAG_input)
-            inputs.push_back(node.id);
-    }
-
-    std::ofstream output(GetBtor2CounterexamplePath());
-    if (!output) {
-        LOG_L(m_log, 1, "WitnessBuilder: failed to open BTOR2 counterexample file.");
+    std::string error;
+    if (!WriteObservedCounterexample(m_wlModel->SourceIR(), trace,
+                                     m_settings.aigFilePath,
+                                     GetBtor2CounterexamplePath(), error)) {
+        LOG_L(m_log, 0, "WitnessBuilder: SourceIR observation export failed: ", error);
         return false;
     }
-
-    const auto writeValues = [&](const std::vector<int64_t> &ids,
-                                 const auto &values) {
-        for (size_t position = 0; position < ids.size(); ++position) {
-            auto value = values.find(ids[position]);
-            if (value != values.end())
-                output << position << " " << value->second.ToBinary() << "\n";
-        }
-    };
-
-    output << "sat\nb0\n";
-    for (size_t time = 0; time < trace.steps.size(); ++time) {
-        const WLTraceStep &step = trace.steps[time];
-        output << "#" << time << "\n";
-        writeValues(states, step.stateValues);
-        output << "@" << time << "\n";
-        writeValues(inputs, step.inputValues);
-    }
-    output << ".\n";
-    return static_cast<bool>(output);
+    return true;
 }
 
 unsigned WitnessBuilder::BuildCube(const Cube &cube) {

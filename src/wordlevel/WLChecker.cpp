@@ -8,6 +8,7 @@
 #include "model/WLModel.h"
 #include "model/Bitblastor.h"
 #include "model/PackageResize.h"
+#include "profiler/Profiler.h"
 
 #include <chrono>
 #include <stdexcept>
@@ -39,16 +40,28 @@ void WLChecker::BuildScalarModel() {
     const auto start = std::chrono::steady_clock::now();
     if (!m_settings.wlBitblastOutputPath.empty())
         throw std::runtime_error("checking build cannot be used for AIG export");
-    if (!m_settings.wlDisablePackageResize)
-        m_resize = std::make_unique<PackageResize>(m_model.PropertyIR());
+    {
+        prof::ScopedSpan resize_span(prof::Stage::MODEL_PACKAGE_RESIZE);
+        if (!m_settings.wlDisablePackageResize)
+            m_resize = std::make_unique<PackageResize>(m_model.PropertyIR());
+    }
     const auto &ir = m_resize ? m_resize->IR() : m_model.PropertyIR();
-    m_aig = GenerateWLAig(ir, m_layout);
-    m_bitModel = std::make_unique<Model>(m_settings, m_log, m_aig);
+    {
+        prof::ScopedSpan bitblast_span(prof::Stage::MODEL_BITBLAST);
+        m_aig = GenerateWLAig(ir, m_layout);
+        prof::ModelStat(prof::MSTAT_AIG_INPUTS, m_aig->num_inputs);
+        prof::ModelStat(prof::MSTAT_AIG_LATCHES, m_aig->num_latches);
+        prof::ModelStat(prof::MSTAT_AIG_ANDS, m_aig->num_ands);
+    }
+    {
+        prof::ScopedSpan checker_span(prof::Stage::MODEL_INIT_CHECKER);
+        m_bitModel = std::make_unique<Model>(m_settings, m_log, m_aig);
+        m_checker = CreateBitLevelChecker(m_settings, *m_bitModel, m_log);
+        if (!m_checker) throw std::runtime_error("word-level checker requires a bit-level checker.");
+    }
     LOG_L(m_log, 1, "word-level model build: ms=",
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(),
           " selectors=0 slots=0");
-    m_checker = CreateBitLevelChecker(m_settings, *m_bitModel, m_log);
-    if (!m_checker) throw std::runtime_error("word-level checker requires a bit-level checker.");
 }
 
 CheckResult WLChecker::Run() {
@@ -83,6 +96,9 @@ const WLTrace &WLChecker::GetTrace() {
             m_bitModel->GetEquivalenceMap(), m_bitModel->TrueId(),
             m_layout, m_checker->GetCexTrace());
         m_trace = m_resize ? m_resize->RestoreTrace(choices) : std::move(choices);
+        // COI may have removed unrelated inputs/free states. Restore concrete
+        // source ports before replay or file export, just as array paths do.
+        m_model.RestoreSourceTrace(m_trace);
     }
     return m_trace;
 }

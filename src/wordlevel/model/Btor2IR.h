@@ -49,6 +49,8 @@ class Btor2IR {
     const Btor2IRSort &Sort(int64_t id) const;
     const Btor2IRNode &Node(int64_t id) const;
     bool HasArrays() const { return m_hasArrays; }
+    const std::string &SourceSha256() const { return m_sourceSha256; }
+    void BindSourceSha256(std::string hash) { m_sourceSha256 = std::move(hash); }
 
     // Check the flat BV-array subset supported by the current execution passes.
     // This explicit capability check also accepts constructed/transformed IRs;
@@ -80,6 +82,7 @@ class Btor2IR {
   private:
     void ObserveId(int64_t id);
 
+    std::string m_sourceSha256;
     bool m_hasArrays{false};
     uint64_t m_nextFreshId{1};
     std::vector<Btor2IRNode> m_nodes;

@@ -5,18 +5,23 @@ namespace car {
 SATSolver::SATSolver(Model &model, MCSATSolver slvKind)
     : m_model(model), m_slvKind(slvKind) {
 
+    m_profInstanceId = prof::Profiler::NextInstanceId();
     switch (m_slvKind) {
     case MCSATSolver::minisat:
         m_slv = std::make_shared<MinisatSolver>(m_model);
+        m_profBackend = prof::BACKEND_MINISAT;
         break;
     case MCSATSolver::cadical:
         m_slv = std::make_shared<CadicalSolver>(m_model);
+        m_profBackend = prof::BACKEND_CADICAL;
         break;
     case MCSATSolver::kissat:
         m_slv = std::make_shared<KissatSolver>(m_model);
+        m_profBackend = prof::BACKEND_KISSAT;
         break;
     case MCSATSolver::minicore:
         m_slv = std::make_shared<MinicoreSolver>(m_model);
+        m_profBackend = prof::BACKEND_MINICORE;
         break;
     default:
         assert(false);
@@ -29,11 +34,18 @@ SATSolver::SATSolver(Model &model, MCSATSolver slvKind)
 }
 
 bool SATSolver::Solve() {
-    return m_slv->Solve();
+    prof::SatScope prof_scope(m_profInstanceId, m_profBackend, 0);
+    const bool result = m_slv->Solve();
+    prof_scope.SetResult(result);
+    return result;
 }
 
 bool SATSolver::Solve(const Cube &assumption) {
-    return m_slv->Solve(assumption);
+    prof::SatScope prof_scope(m_profInstanceId, m_profBackend,
+                              assumption.size());
+    const bool result = m_slv->Solve(assumption);
+    prof_scope.SetResult(result);
+    return result;
 }
 
 std::shared_ptr<MinicoreSolver> SATSolver::GetMinicoreSolver() const {

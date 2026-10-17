@@ -58,10 +58,10 @@ endif()
 set(DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}/src
     ${CMAKE_CURRENT_SOURCE_DIR}/src/model
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/model/aiger
     ${CMAKE_CURRENT_SOURCE_DIR}/src/alg
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sat
     ${CMAKE_CURRENT_SOURCE_DIR}/src/sat/minisat
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/profiler
     ${CMAKE_CURRENT_SOURCE_DIR}/src/frontend/btor2
     ${CMAKE_CURRENT_SOURCE_DIR}/src/wordlevel
     ${CMAKE_CURRENT_SOURCE_DIR}/deps/btor2tools/src
@@ -94,6 +94,7 @@ set(SRCS
     src/wordlevel/model/WLModel.cpp
     src/wordlevel/model/PackageResize.cpp
     src/wordlevel/WLSimulator.cpp
+    src/wordlevel/ObservationSidecar.cpp
     src/wordlevel/WLChecker.cpp
     src/wordlevel/WLCEGAR.cpp
     src/wordlevel/MemoryBMC.cpp
@@ -103,6 +104,7 @@ set(SRCS
     deps/btor2tools/src/btorsim/btorsimrng.c
     src/Settings.cpp
     src/Log.cpp
+    src/profiler/Profiler.cpp
     src/WitnessBuilder.cpp
     src/alg/CheckerFactory.cpp
     src/alg/BCAR.cpp
@@ -166,8 +168,30 @@ set(LIBS ${LIBS} ${KISSAT_LIB})
 
 add_executable(carat ${SRCS})
 target_include_directories(carat PUBLIC ${DIRS})
+# Record the source revision in live-profiler run metadata.
+execute_process(
+    COMMAND git rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE CARAT_GIT_COMMIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET)
+if(CARAT_GIT_COMMIT STREQUAL "")
+    set(CARAT_GIT_COMMIT "unknown")
+endif()
+target_compile_definitions(carat PRIVATE CARAT_GIT_COMMIT="${CARAT_GIT_COMMIT}")
+if(APPLE)
+    # FCAR/IC3 use random_shuffle; libc++ hides this legacy API in C++17.
+    target_compile_definitions(carat PRIVATE _LIBCPP_ENABLE_CXX17_REMOVED_RANDOM_SHUFFLE)
+endif()
 add_library(minicore_lib STATIC ${MINICORE_LIB_SRCS})
 target_include_directories(minicore_lib PUBLIC ${DIRS})
+
+# Live profiler unit tests (ring buffer, protocol, offline round trip).
+add_executable(carat_prof_test tests/profiler/test_profiler.cpp
+                              src/profiler/Profiler.cpp)
+target_include_directories(carat_prof_test PUBLIC ${DIRS})
+find_package(Threads REQUIRED)
+target_link_libraries(carat_prof_test PUBLIC Threads::Threads)
 
 add_executable(minicore ${MINICORE_CLI_SRCS})
 target_include_directories(minicore PUBLIC ${DIRS})
@@ -185,3 +209,16 @@ endif()
 
 message(STATUS "C compiler:   ${CMAKE_C_COMPILER}")
 message(STATUS "CXX compiler: ${CMAKE_CXX_COMPILER}")
+
+# Concrete replay/export only: no model-checking algorithm or SAT backend.
+add_executable(carat-replay
+    tools/cex_observations.cpp
+    src/frontend/btor2/Btor2Frontend.cpp
+    src/wordlevel/model/Btor2IR.cpp
+    src/wordlevel/BitVector.cpp
+    src/wordlevel/WLSimulator.cpp
+    src/wordlevel/ObservationSidecar.cpp
+    deps/btor2tools/src/btor2parser/btor2parser.c
+    deps/btor2tools/src/btorsim/btorsimbv.c
+    deps/btor2tools/src/btorsim/btorsimrng.c)
+target_include_directories(carat-replay PRIVATE ${DIRS})

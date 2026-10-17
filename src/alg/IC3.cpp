@@ -1,5 +1,6 @@
 #include "IC3.h"
 #include "WitnessBuilder.h"
+#include "profiler/Profiler.h"
 #include <iterator>
 #include <algorithm>
 #include <iostream>
@@ -367,28 +368,45 @@ void IC3::Extend() {
 bool IC3::Check() {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_Check");
 
-    if (!m_initialized) {
-        Init();
-        LOG_L(m_log, 2, "Initialized");
-    } else {
-        Reset();
-        LOG_L(m_log, 2, "Reset");
-    }
+    {
+        prof::ScopedSpan init_span(prof::Stage::IC3_INIT);
+        if (!m_initialized) {
+            Init();
+            LOG_L(m_log, 2, "Initialized");
+        } else {
+            Reset();
+            LOG_L(m_log, 2, "Reset");
+        }
 
-    // check if initial state is bad
-    if (ImmediateSatisfiable()) return false;
+        // check if initial state is bad
+        if (ImmediateSatisfiable()) return false;
+    }
 
     // The main IC3 loop.
     while (true) {
-        Extend();
+        prof::IterationBegin(static_cast<uint32_t>(m_k));
+        {
+            prof::ScopedSpan extend_span(prof::Stage::IC3_EXTEND,
+                                         static_cast<uint32_t>(m_k));
+            Extend();
+        }
         LOG_L(m_log, 2, "==================== k = ", m_k, " ====================");
 
         if (!Strengthen()) {
             LOG_L(m_log, 2, "UNSAFE: CEX found during strengthening of F_", m_k);
+            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, false);
             return false;
         }
 
-        if (PropagateFrame()) {
+        bool proved = false;
+        {
+            prof::ScopedSpan prop_span(prof::Stage::IC3_PROPAGATE,
+                                       static_cast<uint32_t>(m_k));
+            proved = PropagateFrame();
+        }
+        prof::IterationEnd(static_cast<uint32_t>(m_k),
+                           m_lfm.BorderSize(m_k + 1), proved);
+        if (proved) {
             LOG_L(m_log, 1, "SAFE: Proof found at F_", m_invariantLevel);
             LOG_L(m_log, 1, FramesInfo());
             return true;
@@ -580,6 +598,7 @@ int IC3::AddLemma(const Cube &blockingCube, int frameLevel, bool fromCTI) {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_AddLemma");
     // add lemma to lemma forest
     auto res = m_lfm.AddLemma(blockingCube, frameLevel);
+    prof::Bump(prof::CTR_IC3_LEMMAS);
 
     // add lemma to solvers
     AddLemmaToSolvers(blockingCube, res.beginLevel, res.endLevel);
@@ -909,13 +928,28 @@ std::shared_ptr<State> IC3::EnumerateStartState() {
 bool IC3::Strengthen() {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_Strengthen");
     m_minUpdateLevel = m_k;
+    prof::ScopedSpan block_span(prof::Stage::IC3_BLOCK,
+                                static_cast<uint32_t>(m_k));
 
     while (true) {
-        if (!HandleObligations()) {
+        bool obligations_hold = false;
+        {
+            prof::ScopedSpan handle_span(prof::Stage::IC3_BLOCK,
+                                         static_cast<uint32_t>(m_k),
+                                         prof::Level::Detail);
+            obligations_hold = HandleObligations();
+        }
+        if (!obligations_hold) {
             return false;
         }
 
-        std::shared_ptr<State> start_state = EnumerateStartState();
+        std::shared_ptr<State> start_state;
+        {
+            prof::ScopedSpan cti_span(prof::Stage::IC3_CTI,
+                                      static_cast<uint32_t>(m_k),
+                                      prof::Level::Detail);
+            start_state = EnumerateStartState();
+        }
         if (start_state != nullptr) {
             AddObligation(start_state, m_k - 1, 1);
         } else {
@@ -948,6 +982,7 @@ ObligationRef IC3::AddObligation(std::shared_ptr<State> state, int level, int de
     [[maybe_unused]] auto scoped = m_log.Section("IC3_AddPO");
     auto ob = std::make_shared<Obligation>(state, level, depth, act);
     m_obligations.insert(ob);
+    prof::Bump(prof::CTR_IC3_OBL_CREATED);
     return ob;
 }
 
@@ -959,6 +994,7 @@ bool IC3::PopObligation(ObligationRef &ob) {
 
         ob = *it;
         m_obligations.erase(it);
+        prof::Bump(prof::CTR_IC3_OBL_DONE);
         return true;
     }
     return false;
@@ -1246,6 +1282,9 @@ bool IC3::ExCTGBlock(const Cube &cb, int frameLvl, int recLvl, int blockLimit) {
 
 void IC3::Generalize(Cube &cb, int frameLvl, int recLvl) {
     [[maybe_unused]] auto scoped = m_log.Section("IC3_Gen");
+    prof::ScopedSpan gen_span(prof::Stage::IC3_GENERALIZE,
+                              static_cast<uint32_t>(frameLvl),
+                              prof::Level::Detail);
     LOG_L(m_log, 3, "Generalizing Cube: ", CubeToStr(cb), ", at frameLvl: ", frameLvl, ", recLvl: ", recLvl);
 
     if (m_settings.shrink > 0 &&
@@ -1533,8 +1572,10 @@ bool IC3::PropagateFrame() {
         for (int lemma_id : lemmas_to_iterate) {
             if (!m_lfm.Alive(lemma_id) || m_lfm.Reachable(lemma_id)) continue;
 
+            prof::Bump(prof::CTR_IC3_PROP_TRIED);
             if (Propagate(lemma_id, i)) {
                 lemmas_propagated++;
+                prof::Bump(prof::CTR_IC3_PROP_OK);
             } else {
                 lemmas_kept++;
             }

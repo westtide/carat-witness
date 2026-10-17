@@ -1,0 +1,505 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>Carat Live Profiler</title>
+<style>
+  :root { --bg:#111418; --panel:#1a1f26; --line:#2a313b; --fg:#d7dde5;
+          --dim:#8b96a5; --acc:#4da3ff; --ok:#3ecf8e; --warn:#f5a623; --bad:#ff5f56; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font:13px/1.45 "SF Mono",Menlo,Consolas,monospace; }
+  header { display:flex; gap:14px; align-items:center; padding:10px 16px;
+           border-bottom:1px solid var(--line); flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; color:var(--acc); }
+  select, button { background:var(--panel); color:var(--fg);
+                   border:1px solid var(--line); border-radius:6px;
+                   padding:4px 10px; font:inherit; }
+  main { display:grid; grid-template-columns: 1fr 1fr; gap:12px; padding:12px 16px; }
+  .card { background:var(--panel); border:1px solid var(--line);
+          border-radius:10px; padding:12px 14px; }
+  .card h2 { font-size:12px; margin:0 0 8px; color:var(--dim);
+             text-transform:uppercase; letter-spacing:.08em; }
+  .card.wide { grid-column:1 / -1; }
+  table { width:100%; border-collapse:collapse; }
+  td, th { text-align:right; padding:3px 6px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:normal; }
+  td:first-child, th:first-child { text-align:left; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:2px 14px; }
+  .kv .k { color:var(--dim); }
+  .badge { padding:1px 8px; border-radius:10px; font-size:11px; }
+  .badge.running { background:#123; color:var(--acc); }
+  .badge.finished { background:#132; color:var(--ok); }
+  .badge.disconnected, .badge.archived { background:#221; color:var(--warn); }
+  .badge.Safe { background:#132; color:var(--ok); }
+  .badge.Unsafe { background:#311; color:var(--bad); }
+  .badge.Unknown { background:#221; color:var(--warn); }
+  .hot { color:var(--bad); font-weight:bold; }
+  #timeline { width:100%; height:260px; background:#0c0f13;
+              border-radius:8px; display:block; cursor:crosshair; }
+  #tip { position:fixed; pointer-events:none; background:#0c0f13;
+         border:1px solid var(--line); border-radius:6px; padding:6px 9px;
+         font-size:12px; display:none; z-index:10; white-space:nowrap; }
+  #legend { display:flex; flex-wrap:wrap; gap:4px 12px; margin-top:8px;
+            font-size:11px; color:var(--dim); }
+  .sw { display:inline-block; width:9px; height:9px; border-radius:2px;
+        margin-right:4px; vertical-align:-1px; }
+  .bar { position:relative; background:#0c0f13; border-radius:3px;
+         height:12px; min-width:80px; overflow:hidden; }
+  .bar i { position:absolute; left:0; top:0; bottom:0; border-radius:3px; }
+  #footnote { color:var(--dim); font-size:11px; margin-top:6px; }
+  canvas.mini { width:100%; height:130px; background:#0c0f13;
+                border-radius:8px; display:block; margin:4px 0 2px; }
+  .charttitle { color:var(--dim); font-size:11px; margin-top:8px; }
+  .muted { color:var(--dim); }
+  .drop { color:var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Carat Live Profiler</h1>
+  <select id="runsel"></select>
+  <button id="refresh">刷新列表</button>
+  <span id="connstate" class="muted">未连接</span>
+  <span style="flex:1"></span>
+  <span id="dropped" class="drop"></span>
+</header>
+<main>
+  <div class="card wide">
+    <h2>Run</h2>
+    <div class="kv" id="runinfo"></div>
+  </div>
+  <div class="card wide">
+    <h2>Algorithm Flame Graph（宽度=时长，越深越内层；悬停看详情；滚轮缩放 / 拖动平移）</h2>
+    <canvas id="timeline"></canvas>
+    <div id="legend"></div>
+    <div id="footnote"></div>
+  </div>
+  <div class="card">
+    <h2>Stage 耗时（wall / 调用数）</h2>
+    <table id="stages"><thead><tr><th>stage</th><th style="width:34%">占比</th><th>calls</th><th>wall ms</th><th>max ms</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h2>SAT 查询</h2>
+    <div class="kv" id="satinfo"></div>
+    <div class="charttitle">SAT 耗时速率（各分类，面积图，ms/s）</div>
+    <canvas id="satchart" class="mini"></canvas>
+    <div class="bar" style="height:16px; margin:6px 0" id="satstack"></div>
+    <table id="satcat"><thead><tr><th>类别</th><th style="width:34%">总耗时</th><th>次数</th><th>总 ms</th><th>max ms</th><th>unsat</th></tr></thead><tbody></tbody></table>
+    <div id="active" style="margin-top:8px"></div>
+  </div>
+  <div class="card">
+    <h2>算法状态（迭代 / 计数器）</h2>
+    <div class="charttitle">每帧/深度迭代耗时（柱状图；绿色 = 收敛/完成帧）</div>
+    <canvas id="iterchart" class="mini"></canvas>
+    <div class="charttitle">计数器趋势（折线图，各序列独立归一化）</div>
+    <canvas id="ctrchart" class="mini"></canvas>
+    <div id="iters" style="max-height:110px; overflow:auto"></div>
+    <table id="counters"><tbody></tbody></table>
+  </div>
+  <div class="card">
+    <h2>模型统计</h2>
+    <table id="mstats"><tbody></tbody></table>
+  </div>
+</main>
+<div id="tip"></div>
+<script>
+"use strict";
+const STAT_NAMES = {1:"BTOR2 节点",2:"COI 后节点",3:"状态数",4:"状态位宽和",
+  5:"数组状态",6:"read 数",7:"write 数",8:"AIG 输入",9:"AIG 锁存器",
+  10:"AIG AND",11:"数组 selector",12:"数组 slot"};
+const CTR_NAMES = {
+  "0x2000":"IC3 obligation 创建","0x2001":"IC3 obligation 完成","0x2002":"队列长度",
+  "0x2010":"IC3 lemma 学习","0x2011":"IC3 传播尝试","0x2012":"IC3 传播成功",
+  "0x2100":"CAR 新状态","0x2101":"unsat core 提取","0x2102":"core 泛化",
+  "0x2103":"core 传播尝试","0x2104":"core 传播成功","0x2105":"restart",
+  "0x2200":"KIND 简单路径对"};
+const SAT_CAT_NAMES = ["other","init","start","lift","block","generalize",
+  "propagate","invariant","base","ind","refine"];
+const STAGE_NAMES = {0:"NONE",
+  101:"MODEL_LOAD",102:"MODEL_COI",103:"MODEL_ARRAY_SIMPLIFY",
+  104:"MODEL_PACKAGE_RESIZE",105:"MODEL_BITBLAST",106:"MODEL_INIT_CHECKER",
+  201:"CEGAR_ROUND",202:"CEGAR_CHECK",203:"CEGAR_CEX_ANALYZE",
+  204:"CEGAR_REFINE",205:"CEGAR_PREFIX_BMC",
+  301:"IC3_INIT",302:"IC3_EXTEND",303:"IC3_CTI",304:"IC3_BLOCK",
+  305:"IC3_GENERALIZE",306:"IC3_PROPAGATE",
+  401:"FCAR_INIT",402:"FCAR_START_ENUM",403:"FCAR_SEARCH",404:"FCAR_LEARN",
+  405:"FCAR_PROPAGATE",406:"FCAR_INVARIANT",
+  501:"BCAR_INIT",502:"BCAR_CHECK_BAD",503:"BCAR_START_ENUM",
+  504:"BCAR_SEARCH",505:"BCAR_LEARN",506:"BCAR_PROPAGATE",
+  507:"BCAR_INVARIANT",508:"BCAR_REFINE",
+  601:"KIND_INIT",602:"KIND_UNROLL",603:"KIND_BASE",604:"KIND_IND",
+  605:"KIND_SIMPLEPATH"};
+function stageName(id){ return STAGE_NAMES[id] || ("STAGE_"+id); }
+// One distinct hue per stage id; 47 and 360 are coprime, so ids spread
+// evenly around the color wheel even within one algorithm family.
+function stageColor(id){
+  const h = (id * 47) % 360;
+  return `hsl(${h} 62% 58%)`;
+}
+function stageColorDark(id){
+  const h = (id * 47) % 360;
+  return `hsl(${h} 55% 30%)`;
+}
+const $=id=>document.getElementById(id);
+let ws=null, curRun=null, snap=null;
+let view={t0:0, t1:1, pinned:false};
+
+async function loadRuns(){
+  const r=await fetch("/api/runs"); const j=await r.json();
+  const sel=$("runsel"); const prev=sel.value;
+  sel.innerHTML="";
+  const runs=j.runs||[];
+  for(const run of runs){
+    const o=document.createElement("option");
+    o.value=run.id;
+    o.textContent=`${run.id}  ${run.algorithm||""}  ${run.state}`;
+    sel.appendChild(o);
+  }
+  if(prev && runs.some(x=>x.id===prev)) sel.value=prev;
+  else if(runs.length) sel.value=runs[0].id;
+  if(!curRun || curRun!==sel.value){ curRun=sel.value; view.pinned=false; connectWS(); }
+}
+function connectWS(){
+  if(ws) ws.close();
+  if(!curRun) return;
+  const proto=location.protocol==="https:"?"wss":"ws";
+  ws=new WebSocket(`${proto}://${location.host}/ws?id=${curRun}`);
+  ws.onopen=()=>$("connstate").textContent="实时连接中";
+  ws.onclose=()=>{
+    const done = snap && snap.run && snap.run.state!=="running";
+    if(done){ $("connstate").textContent="运行已结束（完整数据）"; return; }
+    $("connstate").textContent="已断开，2s 后重连";
+    setTimeout(connectWS,2000);
+  };
+  ws.onmessage=e=>{ snap=JSON.parse(e.data); render(); };
+}
+function fmt(n,d=1){ return (n===null||n===undefined)?"-":Number(n).toFixed(d); }
+function render(){
+  if(!snap) return;
+  const run=snap.run;
+  const rows=[];
+  const push=(k,v)=>rows.push(`<span class="k">${k}</span><span>${v}</span>`);
+  push("算法", run.algorithm||"-");
+  push("模型", (run.model||"-").split("/").pop());
+  push("SAT 后端", run.sat_backend||"-");
+  push("commit", run.commit||"-");
+  push("级别", run.trace_level||"-");
+  push("状态", `<span class="badge ${run.state}">${run.state}</span>`+
+              (run.result?` <span class="badge ${run.result}">${run.result}</span>`:""));
+  push("已运行", fmt(run.elapsed_ms/1000,2)+" s");
+  push("事件数", run.events||0);
+  push("当前阶段", (snap.current.stage_path||[]).join(" → ")||"-");
+  const p=snap.process||{};
+  push("CPU / RSS", p.sampled?`${fmt(p.cpu_pct,0)}% / ${fmt(p.rss_mb,0)} MB (峰值 ${fmt(p.peak_rss_mb,0)} MB)`:"未采集");
+  $("runinfo").innerHTML=rows.join("");
+  $("dropped").textContent = run.dropped>0?`⚠ 事件丢失 ${run.dropped} 条，统计可能不完整`:"";
+
+  // stage table with bars
+  const st_list=(snap.stages||[]).slice(0,16);
+  const maxWall=st_list.length?Math.max(...st_list.map(s=>s.wall_ms)):1;
+  const tb=$("stages").tBodies[0]; tb.innerHTML="";
+  for(const st of st_list){
+    tb.insertAdjacentHTML("beforeend",
+      `<tr><td><span class="sw" style="background:${stageColor(st.stage)}"></span>${st.name}</td>`+
+      `<td><div class="bar"><i style="width:${(st.wall_ms/maxWall*100).toFixed(1)}%;background:${stageColor(st.stage)}"></i></div></td>`+
+      `<td>${st.count}</td><td>${fmt(st.wall_ms)}</td><td>${fmt(st.max_ms)}</td></tr>`);
+  }
+
+  const sat=snap.sat||{};
+  const pct=(v)=> (sat.queries>0 && v===0) ? "n/a" : fmt(v,2);
+  $("satinfo").innerHTML=
+    `<span class="k">查询总数</span><span>${sat.queries||0}</span>`+
+    `<span class="k">总耗时</span><span>${fmt(sat.total_ms)} ms</span>`+
+    `<span class="k">p50/p95/p99</span><span>${pct(sat.p50_ms)} / ${pct(sat.p95_ms)} / ${pct(sat.p99_ms)} ms</span>`;
+  // stacked share bar of total SAT time by category
+  const cats=(sat.by_category||[]).filter(c=>c.total_ms>0);
+  const satTotal=Math.max(1, cats.reduce((a,c)=>a+c.total_ms,0));
+  $("satstack").innerHTML = cats.map((c,i)=>
+    `<i style="left:${(cats.slice(0,i).reduce((a,x)=>a+x.total_ms,0)/satTotal*100).toFixed(1)}%;`+
+    `width:${(c.total_ms/satTotal*100).toFixed(1)}%;background:${satCatColor(c.cat)}"></i>`).join("");
+  const sc=$("satcat").tBodies[0]; sc.innerHTML="";
+  const maxCatMs=cats.length?Math.max(...cats.map(c=>c.total_ms)):1;
+  for(const c of (sat.by_category||[])){
+    if(!c.count) continue;
+    sc.insertAdjacentHTML("beforeend",
+      `<tr><td><span class="sw" style="background:${satCatColor(c.cat)}"></span>${c.name}</td>`+
+      `<td><div class="bar"><i style="width:${(c.total_ms/maxCatMs*100).toFixed(1)}%;background:${satCatColor(c.cat)}"></i></div></td>`+
+      `<td>${c.count}</td><td>${fmt(c.total_ms)}</td><td>${fmt(c.max_ms)}</td>`+
+      `<td>${c.unsat||""}</td></tr>`);
+  }
+  const act=sat.active||[];
+  $("active").innerHTML = act.length
+    ? act.map(q=>`<div class="${(q.started_ms_ago||0)>10000?"hot":""}">`+
+        `● SAT 执行中 cat=${q.cat_name||"-"} stage=${q.stage_name||"-"} `+
+        `已 ${fmt((q.started_ms_ago||0)/1000,1)} s</div>`).join("")
+    : `<div class="muted">当前无执行中的 SAT 查询</div>`;
+
+  const it=snap.iterations||[];
+  $("iters").innerHTML = it.length
+    ? it.slice(-24).map(x=>`帧/深度 ${x.iter}: `+
+        (x.end_ms==null?`<span style="color:var(--acc)">进行中</span>`
+         :`${x.end_ms-x.begin_ms} ms${x.converged?" ✓收敛":""}`)).join("<br>")
+    : `<span class="muted">尚无迭代</span>`;
+  const ct=$("counters").tBodies[0]; ct.innerHTML="";
+  for(const [k,v] of Object.entries(snap.counters||{})){
+    ct.insertAdjacentHTML("beforeend",
+      `<tr><td>${CTR_NAMES[k]||k}</td><td>${v}</td></tr>`);
+  }
+  const ms=$("mstats").tBodies[0]; ms.innerHTML="";
+  for(const [k,v] of Object.entries(snap.model_stats||{})){
+    ms.insertAdjacentHTML("beforeend",
+      `<tr><td>${STAT_NAMES[k]||("stat "+k)}</td><td>${v}</td></tr>`);
+  }
+  drawTimeline();
+  drawSatRateChart();
+  drawIterChart();
+  drawCounterChart();
+}
+function satCatColor(cat){
+  // warm ramp: heavier query categories lean red
+  const names=["other","init","start","lift","block","generalize","propagate","invariant","base","ind","refine"];
+  const idx=names.indexOf(SAT_CAT_NAMES[cat]||"other");
+  const h = 200 - idx*18;
+  return `hsl(${Math.max(0,h)} 70% 58%)`;
+}
+// ---- generic time-series chart (line / area) ----
+// series: [{name, color, pts:[[tMs,v]...], fill:bool, norm:bool}]
+function drawChart(cv, series, opts={}){
+  const dpr=devicePixelRatio||1;
+  const w=cv.clientWidth, h=cv.clientHeight;
+  if(!w||!h) return;
+  if(cv.width!==w*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
+  const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  const padL=38, padR=6, padT=8, padB=16;
+  const iw=w-padL-padR, ih=h-padT-padB;
+  if(!series.length){ ctx.fillStyle="#8b96a5"; ctx.font="11px monospace";
+    ctx.fillText("暂无序列数据",padL+6,padT+14); return; }
+  let t0=Infinity,t1=-Infinity;
+  for(const s of series) for(const p of s.pts){ t0=Math.min(t0,p[0]); t1=Math.max(t1,p[0]); }
+  if(t1<=t0) t1=t0+1;
+  // per-series normalization flag: hugely different magnitudes share one plot
+  const maxes=series.map(s=>Math.max(1e-9,...s.pts.map(p=>p[1])));
+  const gmax=Math.max(...maxes);
+  const X=t=>padL+(t-t0)/(t1-t0)*iw;
+  // grid + axes
+  ctx.strokeStyle="#2a313b"; ctx.fillStyle="#8b96a5"; ctx.font="9px monospace";
+  for(let g=0; g<=4; g++){
+    const y=padT+ih*g/4;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    ctx.fillText(fmtSI(opts.yMax? opts.yMax*(1-g/4) : gmax*(1-g/4)),2,y+3);
+  }
+  for(let g=0; g<=4; g++){
+    const x=padL+iw*g/4, ms=t0+(t1-t0)*g/4;
+    ctx.fillText(ms>=1000?(ms/1000).toFixed(1)+"s":ms.toFixed(0),x-6,h-4);
+  }
+  for(const s of series){
+    if(s.pts.length<2) continue;
+    const m=s.norm? maxes[series.indexOf(s)] : gmax;
+    const Y=v=>padT+ih*(1-Math.min(v,m)/m);
+    ctx.beginPath();
+    s.pts.forEach((p,i)=> i?ctx.lineTo(X(p[0]),Y(p[1])):ctx.moveTo(X(p[0]),Y(p[1])));
+    if(s.fill){
+      ctx.save();
+      ctx.lineTo(X(s.pts[s.pts.length-1][0]),padT+ih);
+      ctx.lineTo(X(s.pts[0][0]),padT+ih);
+      ctx.closePath();
+      ctx.globalAlpha=0.18; ctx.fillStyle=s.color; ctx.fill(); ctx.restore();
+      // redraw the crisp line over the fill border
+      ctx.beginPath();
+      s.pts.forEach((p,i)=> i?ctx.lineTo(X(p[0]),Y(p[1])):ctx.moveTo(X(p[0]),Y(p[1])));
+    }
+    ctx.strokeStyle=s.color; ctx.lineWidth=1.5; ctx.stroke(); ctx.lineWidth=1;
+    // end-point marker
+    const last=s.pts[s.pts.length-1];
+    ctx.fillStyle=s.color;
+    ctx.fillRect(X(last[0])-2,Y(last[1])-2,4,4);
+  }
+}
+function fmtSI(v){
+  if(v>=1e9) return (v/1e9).toFixed(1)+"G";
+  if(v>=1e6) return (v/1e6).toFixed(1)+"M";
+  if(v>=1e3) return (v/1e3).toFixed(1)+"k";
+  if(v>=100) return v.toFixed(0);
+  if(v>=10) return v.toFixed(1);
+  return v.toFixed(2);
+}
+// SAT rate area chart: difference the cumulative series into ms/s
+function drawSatRateChart(){
+  const raw=snap&&snap.sat_series;
+  const cv=$("satchart");
+  if(!raw) return drawChart(cv,[],{});
+  const series=[];
+  for(const [name,pts] of Object.entries(raw)){
+    if(pts.length<2) continue;
+    const rate=[];
+    for(let i=1;i<pts.length;i++){
+      const dt=Math.max(1,pts[i].t-pts[i-1].t);
+      const dv=(pts[i].v-pts[i-1].v)/1000; // µs -> ms
+      rate.push([pts[i].t, dv/dt*1000]);  // ms per second
+    }
+    if(rate.length<2) continue;
+    const cat=SAT_CAT_NAMES.findIndex(n=>n===name);
+    series.push({name,color:satCatColor(cat>=0?cat:0),pts:rate,fill:true,norm:false});
+  }
+  drawChart(cv,series);
+}
+// Iteration bar chart: wall ms per frame/depth
+function drawIterChart(){
+  const cv=$("iterchart");
+  const dpr=devicePixelRatio||1;
+  const w=cv.clientWidth, h=cv.clientHeight;
+  if(!w||!h) return;
+  if(cv.width!==w*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
+  const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  const it=(snap&&snap.iterations)||[];
+  if(it.length<1){ ctx.fillStyle="#8b96a5"; ctx.fillText("尚无迭代",10,16); return; }
+  const padL=34, padR=6, padT=6, padB=14;
+  const iw=w-padL-padR, ih=h-padT-padB;
+  const bars=it.slice(-160); // newest frames
+  const maxV=Math.max(1,...bars.map(x=>x.end_ms!=null?x.end_ms-x.begin_ms:0));
+  const bw=Math.max(1,iw/bars.length-1);
+  ctx.strokeStyle="#2a313b"; ctx.fillStyle="#8b96a5"; ctx.font="9px monospace";
+  for(let g=0; g<=3; g++){
+    const y=padT+ih*g/3;
+    ctx.beginPath(); ctx.moveTo(padL,y); ctx.lineTo(w-padR,y); ctx.stroke();
+    ctx.fillText(fmtSI(maxV*(1-g/3)),2,y+3);
+  }
+  bars.forEach((x,i)=>{
+    if(x.end_ms==null) return; // running frame
+    const v=x.end_ms-x.begin_ms;
+    const bh=Math.max(1,v/maxV*ih);
+    ctx.fillStyle=x.converged?"#3ecf8e":"#4da3ff";
+    ctx.fillRect(padL+i*(bw+1),padT+ih-bh,bw,bh);
+  });
+  ctx.fillText(`帧 ${bars[0].iter}…${bars[bars.length-1].iter}`,padL,h-3);
+}
+// Counter trend lines (each normalized to its own max)
+function drawCounterChart(){
+  const raw=snap&&snap.counter_series;
+  const cv=$("ctrchart");
+  if(!raw) return drawChart(cv,[],{});
+  const entries=Object.entries(raw).filter(([k,pts])=>pts.length>=3);
+  if(!entries.length) return drawChart(cv,[],{});
+  // pick the 4 series with the largest relative growth
+  entries.sort((a,b)=>{
+    const ga=a[1][a[1].length-1].v-a[1][0].v, gb=b[1][b[1].length-1].v-b[1][0].v;
+    return gb-ga;
+  });
+  const pick=entries.slice(0,4);
+  const series=pick.map(([k,pts])=>({
+    name:CTR_NAMES[k]||k, color:ctrLineColor(k), pts:pts.map(p=>[p.t,p.v]),
+    fill:false, norm:true }));
+  drawChart(cv,series);
+  cv.title=pick.map(([k])=>`${CTR_NAMES[k]||k}`).join(" / ")+
+    "\n（各序列独立归一化；精确值见下表）";
+}
+function ctrLineColor(key){
+  let h=0; for(const c of key) h=(h*31+c.charCodeAt(0))%360;
+  return `hsl(${h} 62% 60%)`;
+}
+// ---- flame graph (icicle) canvas ----
+let rectHit=[];   // [x1,x2,y1,y2,row] for hover lookup
+function drawTimeline(){
+  const cv=$("timeline"), dpr=devicePixelRatio||1;
+  const w=cv.clientWidth, h=cv.clientHeight;
+  if(cv.width!==w*dpr){ cv.width=w*dpr; cv.height=h*dpr; }
+  const ctx=cv.getContext("2d"); ctx.setTransform(dpr,0,0,dpr,0,0);
+  ctx.clearRect(0,0,w,h);
+  const spans=(snap&&snap.timeline)||[];
+  rectHit=[];
+  if(!spans.length){ ctx.fillStyle="#8b96a5"; ctx.fillText("等待阶段数据…",12,24); return; }
+  // resolve parents and depth
+  const bySpan={}; for(const s of spans) bySpan[s.span]=s;
+  const depthOf=s=>{ let d=0,p=s.parent; while(p&&bySpan[p]){d++;p=bySpan[p].parent;} return d; };
+  let maxDepth=0; for(const s of spans) maxDepth=Math.max(maxDepth, depthOf(s));
+  // focus window on the newest ~2/3 of history by default so the flame tip
+  // stays readable on long runs
+  let t0=Infinity,t1=0;
+  for(const s of spans){ t0=Math.min(t0,s.begin_ms); t1=Math.max(t1,s.end_ms); }
+  if(t1<=t0) t1=t0+1;
+  if(!view.pinned){
+    const span=t1-t0;
+    view={t0: t0 - span*0.05, t1: t1 + span*0.02, pinned:true};
+  }
+  const V=view, scale=w/(V.t1-V.t0);
+  // axis
+  ctx.strokeStyle="#2a313b"; ctx.fillStyle="#8b96a5"; ctx.font="10px monospace";
+  for(let g=0; g<=6; g++){
+    const x=g*w/6, ms=V.t0+(V.t1-V.t0)*g/6;
+    ctx.beginPath(); ctx.moveTo(x,16); ctx.lineTo(x,h); ctx.stroke();
+    ctx.fillText(ms>=1000?(ms/1000).toFixed(1)+"s":ms.toFixed(0)+"ms",x+2,12);
+  }
+  const rows=Math.min(maxDepth+1,14);
+  const rowH=Math.min(24,(h-22)/rows);
+  // draw parents first so children layer on top of deeper rows
+  const sorted=[...spans].sort((a,b)=>depthOf(a)-depthOf(b)||a.begin_ms-b.begin_ms);
+  const present=new Set();
+  for(const s of sorted){
+    const d=Math.min(depthOf(s),rows-1);
+    const x1=(s.begin_ms-V.t0)*scale, x2=Math.max(x1+1.5,(s.end_ms-V.t0)*scale);
+    const y=20+d*rowH;
+    ctx.fillStyle=stageColor(s.stage);
+    ctx.globalAlpha=s.open?0.95:0.88;
+    ctx.fillRect(x1,y,x2-x1,rowH-1.5);
+    ctx.globalAlpha=1;
+    if(s.open){ // growing edge on live spans
+      ctx.strokeStyle="#ffffffcc"; ctx.lineWidth=1.2;
+      ctx.strokeRect(x1+0.5,y+0.5,x2-x1-1,rowH-2.5);
+      ctx.lineWidth=1;
+    } else {
+      ctx.strokeStyle=stageColorDark(s.stage);
+      ctx.strokeRect(x1+0.5,y+0.5,x2-x1-1,rowH-2.5);
+    }
+    // label when it fits
+    if(x2-x1>46){
+      ctx.fillStyle="#0c0f13"; ctx.font=`${Math.max(9,rowH-7)}px monospace`;
+      ctx.fillText(s.name.slice(0,Math.floor((x2-x1)/6.4)),x1+3,y+rowH-5);
+    }
+    present.add(s.stage);
+    rectHit.push([x1,x2,y,y+rowH,s]);
+  }
+  // legend of stages currently drawn
+  $("legend").innerHTML=[...present].sort((a,b)=>a-b).map(id=>
+    `<span><span class="sw" style="background:${stageColor(id)}"></span>${stageName(id)}</span>`).join("");
+  const openCount=spans.filter(s=>s.open).length;
+  $("footnote").textContent=`火焰图：${spans.length} 个 span（${openCount} 个执行中，白框标记）`+
+    `，深度 ${maxDepth+1} 层；运行 ${((snap.run.elapsed_ms||0)/1000).toFixed(1)}s`;
+}
+$("timeline").addEventListener("mousemove",e=>{
+  const mx=e.offsetX, my=e.offsetY, tip=$("tip");
+  let hit=null;
+  for(const [x1,x2,y1,y2,s] of rectHit){
+    if(mx>=x1&&mx<=x2&&my>=y1&&my<=y2){ hit=s; break; }
+  }
+  if(!hit){ tip.style.display="none"; return; }
+  tip.style.display="block";
+  tip.style.left=(e.clientX+14)+"px"; tip.style.top=(e.clientY+10)+"px";
+  tip.innerHTML=`<b style="color:${stageColor(hit.stage)}">${hit.name}</b>`+
+    (hit.open?` <span style="color:var(--acc)">执行中</span>`:"")+
+    `<br>时长 ${(hit.end_ms-hit.begin_ms).toFixed(1)} ms`+
+    `<br>ctx ${hit.ctx} · thread ${hit.thread}`;
+});
+$("timeline").addEventListener("mouseleave",()=>$("tip").style.display="none");
+$("timeline").addEventListener("wheel",e=>{
+  e.preventDefault();
+  const f=e.deltaY>0?1.2:1/1.2, c=view.t0+(view.t1-view.t0)*(e.offsetX/e.target.clientWidth);
+  view.t0=c-(c-view.t0)*f; view.t1=c+(view.t1-c)*f; drawTimeline();
+},{passive:false});
+let drag=null;
+$("timeline").addEventListener("mousedown",e=>drag={x:e.offsetX,t0:view.t0,t1:view.t1});
+addEventListener("mousemove",e=>{
+  if(!drag||!snap) return;
+  const w=$("timeline").clientWidth, dx=e.offsetX-drag.x, span=drag.t1-drag.t0;
+  const shift=-dx/w*span;
+  view.t0=drag.t0+shift; view.t1=drag.t1+shift; drawTimeline();
+});
+addEventListener("mouseup",()=>drag=null);
+$("runsel").onchange=()=>{ curRun=$("runsel").value; view.pinned=false; connectWS(); };
+$("refresh").onclick=loadRuns;
+loadRuns(); setInterval(loadRuns,3000);
+</script>
+</body>
+</html>

@@ -164,6 +164,25 @@ bool BMC::CheckNonIncremental() {
     // before Clause^k Clause^(k+1) Clause^(k+2) ConstraintsK(k) ConstraintsK(k+1) ConstraintsK(k+2) (bad^(k)|bad^(k+1)|bad^(k+2))
     Clause bad_clause;
     bad_clause.reserve(m_step);
+    const auto recoverEndpoint = [&]() {
+        // m_k has already advanced past this SAT batch. Export only a prefix
+        // ending at an actually satisfied bad, never the unqueried next frame.
+        const int first = m_k - static_cast<int>(bad_clause.size());
+        for (size_t offset = 0; offset < bad_clause.size(); ++offset) {
+            const Lit bad = bad_clause[offset];
+            bool reached = IsConstTrue(bad);
+            if (!IsConstTrue(bad) && !IsConstFalse(bad)) {
+                const auto value = m_solver->GetModel(VarOf(bad));
+                reached = (value == T_TRUE && !Sign(bad)) ||
+                          (value == T_FALSE && Sign(bad));
+            }
+            if (reached) {
+                m_k = first + static_cast<int>(offset);
+                return true;
+            }
+        }
+        throw std::runtime_error("SAT BMC batch has no satisfied bad endpoint");
+    };
     // Pre-allocate m_step memory
     while (true) {
         Init();
@@ -202,7 +221,14 @@ bool BMC::CheckNonIncremental() {
             {
                 [[maybe_unused]] auto clause_scope = m_log.Section("Add_Cons_Cls");
                 for (auto c : GetConstraintsK(m_k)) {
-                    m_solver->AddClause({c});
+                    // A counterexample needs constraints only through its
+                    // endpoint. An earlier bad may be followed by an illegal
+                    // frame (for example a source error followed by assume(false)).
+                    Clause prefix = bad_clause;
+                    prefix.back() = c; // preceding bads OR this frame's constraint
+                    m_solver->AddClause(prefix);
+                    // A subsequent batch is reached only after this whole
+                    // batch was UNSAT with all its bads false, so units apply.
                     m_clauses.push_back({c}); // store for further use
                     LOG_L(m_log, 3, "Add Clause: ", ToSigned(c));
                 }
@@ -218,7 +244,7 @@ bool BMC::CheckNonIncremental() {
                 [[maybe_unused]] auto sat_scope = m_log.Section("SAT_BMC_NonInc");
                 bool sat = m_solver->Solve();
                 if (sat)
-                    return true;
+                    return recoverEndpoint();
                 else
                     return false;
             }
@@ -228,7 +254,7 @@ bool BMC::CheckNonIncremental() {
         [[maybe_unused]] auto sat_scope = m_log.Section("SAT_BMC_NonInc");
         bool sat = m_solver->Solve();
         if (sat)
-            return true;
+            return recoverEndpoint();
     }
 }
 

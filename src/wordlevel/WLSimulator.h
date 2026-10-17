@@ -70,7 +70,8 @@ class WLSimulator {
     // states may be omitted; if supplied, they are checked, not trusted.
     // Requires constraints through the last frame and bad in that last frame.
     // Incomplete/failed candidates do NOT prove an abstract trace spurious.
-    VerificationResult Verify(const WLTrace &trace);
+    using FrameCallback = std::function<void(size_t, const Frame &)>;
+    VerificationResult Verify(const WLTrace &trace, const FrameCallback &onFrame = {});
 
     // Extend a verified property-COI candidate with omitted free choices.
     // Derived states remain computed by Verify on full SourceIR. This extension

@@ -1,7 +1,7 @@
 #pragma once
 
 extern "C" {
-#include "aiger.h"
+#include "aiger/aiger.h"
 }
 
 #include "CarTypes.h"

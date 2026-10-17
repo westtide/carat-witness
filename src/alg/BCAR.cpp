@@ -1,5 +1,6 @@
 #include "BCAR.h"
 #include "WitnessBuilder.h"
+#include "profiler/Profiler.h"
 #include <stack>
 #include <string>
 
@@ -88,24 +89,31 @@ void BCAR::InitializeBadSolver() {
 bool BCAR::Check() {
     [[maybe_unused]] auto check_scope = m_log.Section("FC_Check");
 
-    Init();
-    LOG_L(m_log, 2, "Initialized");
+    {
+        prof::ScopedSpan init_span(prof::Stage::BCAR_INIT);
+        Init();
+        LOG_L(m_log, 2, "Initialized");
 
-    if (!CheckBad(std::make_shared<State>(nullptr, Cube{}, Cube{}, 0))) {
-        LOG_L(m_log, 1, "Bad State not reachable");
-        m_overSequence->SetInvariantLevel(-1);
-        return true;
-    }
+        {
+            prof::ScopedSpan bad_span(prof::Stage::BCAR_CHECK_BAD);
+            if (!CheckBad(std::make_shared<State>(nullptr, Cube{}, Cube{}, 0))) {
+                LOG_L(m_log, 1, "Bad State not reachable");
+                m_overSequence->SetInvariantLevel(-1);
+                return true;
+            }
+        }
 
-    if (ImmediateSatisfiable()) {
-        LOG_L(m_log, 1, "Immediate Satisfiable");
-        return false;
+        if (ImmediateSatisfiable()) {
+            LOG_L(m_log, 1, "Immediate Satisfiable");
+            return false;
+        }
     }
 
     // main stage
     std::stack<Task> working_stack;
     while (true) {
         [[maybe_unused]] auto frame_scope = m_log.Section("FC_Frame");
+        prof::IterationBegin(static_cast<uint32_t>(m_k));
         m_minUpdateLevel = m_k + 1;
         if (m_settings.dt) { // Dynamic Traversal
             auto dtseq = m_underSequence.GetSeqDT();
@@ -123,98 +131,148 @@ bool BCAR::Check() {
         LOG_L(m_log, 2, "Start Frame: ", m_k);
         LOG_L(m_log, 2, "Working Stack Size: ", working_stack.size());
 
-        std::shared_ptr<State> start_state = EnumerateStartState();
+        std::shared_ptr<State> start_state;
+        {
+            prof::ScopedSpan enum_span(prof::Stage::BCAR_START_ENUM,
+                                       static_cast<uint32_t>(m_k));
+            start_state = EnumerateStartState();
+        }
 
         while (start_state != nullptr) {
             LOG_L(m_log, 2, "State from StartSolver: ", CubeToStrShort(start_state->latches));
             LOG_L(m_log, 3, "State Detail: ", CubeToStr(start_state->latches));
             working_stack.emplace(start_state, m_k - 1, true);
 
-            while (!working_stack.empty()) {
-                [[maybe_unused]] auto task_scope = m_log.Section("FC_Task");
-                Task &task = working_stack.top();
+            {
+                prof::ScopedSpan search_span(prof::Stage::BCAR_SEARCH,
+                                             static_cast<uint32_t>(m_k));
+                while (!working_stack.empty()) {
+                    [[maybe_unused]] auto task_scope = m_log.Section("FC_Task");
+                    prof::ScopedSpan task_span(prof::Stage::BCAR_SEARCH,
+                                               static_cast<uint32_t>(m_k),
+                                               prof::Level::Detail);
+                    Task &task = working_stack.top();
 
-                if (m_settings.restart && m_restart->RestartCheck()) {
-                    LOG_L(m_log, 1, "Restarting...");
-                    m_underSequence = UnderSequence();
-                    while (!working_stack.empty()) working_stack.pop();
-                    m_restart->UpdateThreshold();
-                    m_restart->ResetUcCounts();
-                    continue;
-                }
-
-                if (!task.isLocated) {
-                    task.frameLevel = GetNewLevel(task.state->latches, task.frameLevel + 1);
-                    LOG_L(m_log, 3, "State get new Level ", task.frameLevel);
-                }
-
-                if (task.frameLevel >= m_k) {
-                    working_stack.pop();
-                    continue;
-                }
-
-                task.isLocated = false;
-
-                if (task.frameLevel == -1) {
-                    if (CheckBad(task.state))
-                        return false;
-                    else
+                    if (m_settings.restart && m_restart->RestartCheck()) {
+                        LOG_L(m_log, 1, "Restarting...");
+                        prof::Bump(prof::CTR_CAR_RESTARTS);
+                        m_underSequence = UnderSequence();
+                        while (!working_stack.empty()) working_stack.pop();
+                        m_restart->UpdateThreshold();
+                        m_restart->ResetUcCounts();
                         continue;
-                }
+                    }
 
-                Cube assumption(task.state->latches);
-                OrderAssumption(assumption);
-                LOG_L(m_log, 2, "SAT Check on frame: ", task.frameLevel);
-                LOG_L(m_log, 3, "From state: ", CubeToStr(task.state->latches));
-                bool result = IsReachable(task.frameLevel, assumption, "SAT_BC_Main");
-                if (result) {
-                    // Solver return SAT, get a new State, then continue
-                    LOG_L(m_log, 2, "Result >>> SAT <<<");
-                    auto p = m_transSolvers[task.frameLevel]->GetAssignment(true);
-                    auto new_state =
-                        std::make_shared<State>(task.state, p.first, p.second, task.state->depth + 1);
-                    LOG_L(m_log, 3, "Get state: ", CubeToStr(new_state->latches));
-                    m_underSequence.Push(new_state);
-                    if (m_settings.dt) task.state->HasSucc();
-                    int new_frame_level = GetNewLevel(new_state->latches);
-                    working_stack.emplace(new_state, new_frame_level, true);
-                } else {
-                    // Solver return UNSAT, get uc, then continue
-                    LOG_L(m_log, 2, "Result >>> UNSAT <<<");
-                    auto uc = GetUnsatAssumption(m_transSolvers[task.frameLevel], task.state->latches);
-                    LOG_L(m_log, 3, "Get UC:", CubeToStr(uc));
-                    Generalize(uc, task.frameLevel);
-                    LOG_L(m_log, 2, "Get Generalized UC:", CubeToStr(uc));
-                    AddUnsatisfiableCore(uc, task.frameLevel + 1, true);
-                    if (m_settings.dt) task.state->HasUC();
-                    task.frameLevel = PropagateUp(uc, task.frameLevel + 1);
-                    LOG_L(m_log, 3, m_overSequence->FramesInfo());
+                    if (!task.isLocated) {
+                        task.frameLevel = GetNewLevel(task.state->latches, task.frameLevel + 1);
+                        LOG_L(m_log, 3, "State get new Level ", task.frameLevel);
+                    }
+
+                    if (task.frameLevel >= m_k) {
+                        working_stack.pop();
+                        continue;
+                    }
+
+                    task.isLocated = false;
+
+                    if (task.frameLevel == -1) {
+                        bool bad_reachable = false;
+                        {
+                            prof::ScopedSpan bad_span(prof::Stage::BCAR_CHECK_BAD,
+                                                      static_cast<uint32_t>(task.frameLevel));
+                            bad_reachable = CheckBad(task.state);
+                        }
+                        if (bad_reachable) {
+                            prof::IterationEnd(static_cast<uint32_t>(m_k), 0, false);
+                            return false;
+                        } else
+                            continue;
+                    }
+
+                    Cube assumption(task.state->latches);
+                    OrderAssumption(assumption);
+                    LOG_L(m_log, 2, "SAT Check on frame: ", task.frameLevel);
+                    LOG_L(m_log, 3, "From state: ", CubeToStr(task.state->latches));
+                    bool result = IsReachable(task.frameLevel, assumption, "SAT_BC_Main");
+                    if (result) {
+                        // Solver return SAT, get a new State, then continue
+                        LOG_L(m_log, 2, "Result >>> SAT <<<");
+                        auto p = m_transSolvers[task.frameLevel]->GetAssignment(true);
+                        auto new_state =
+                            std::make_shared<State>(task.state, p.first, p.second, task.state->depth + 1);
+                        LOG_L(m_log, 3, "Get state: ", CubeToStr(new_state->latches));
+                        m_underSequence.Push(new_state);
+                        prof::Bump(prof::CTR_CAR_NEW_STATES);
+                        if (m_settings.dt) task.state->HasSucc();
+                        int new_frame_level = GetNewLevel(new_state->latches);
+                        working_stack.emplace(new_state, new_frame_level, true);
+                    } else {
+                        // Solver return UNSAT, get uc, then continue
+                        LOG_L(m_log, 2, "Result >>> UNSAT <<<");
+                        prof::ScopedSpan learn_span(prof::Stage::BCAR_LEARN,
+                                                    static_cast<uint32_t>(task.frameLevel),
+                                                    prof::Level::Detail);
+                        auto uc = GetUnsatAssumption(m_transSolvers[task.frameLevel], task.state->latches);
+                        prof::Bump(prof::CTR_CAR_CORES);
+                        LOG_L(m_log, 3, "Get UC:", CubeToStr(uc));
+                        Generalize(uc, task.frameLevel);
+                        prof::Bump(prof::CTR_CAR_GEN_OK);
+                        LOG_L(m_log, 2, "Get Generalized UC:", CubeToStr(uc));
+                        AddUnsatisfiableCore(uc, task.frameLevel + 1, true);
+                        if (m_settings.dt) task.state->HasUC();
+                        task.frameLevel = PropagateUp(uc, task.frameLevel + 1);
+                        LOG_L(m_log, 3, m_overSequence->FramesInfo());
+                    }
                 }
             }
-            start_state = EnumerateStartState();
+            {
+                prof::ScopedSpan enum_span(prof::Stage::BCAR_START_ENUM,
+                                           static_cast<uint32_t>(m_k));
+                start_state = EnumerateStartState();
+            }
         }
 
         // inv
         m_invSolver = std::make_shared<SATSolver>(m_model, MCSATSolver::cadical);
-        IsInvariant(0);
+        {
+            prof::ScopedSpan inv_span(prof::Stage::BCAR_INVARIANT, 0);
+            IsInvariant(0);
+        }
         for (int i = 0; i < m_k; ++i) {
             // propagation
             if (i >= m_minUpdateLevel) {
                 auto lemma_ids = m_overSequence->FrameIds(i);
+                prof::ScopedSpan prop_span(prof::Stage::BCAR_PROPAGATE,
+                                           static_cast<uint32_t>(i));
                 for (auto lemma_id : lemma_ids) {
                     if (m_overSequence->Contains(lemma_id, i + 1)) continue; // propagated
                     const Cube &uc = m_overSequence->CubeOf(lemma_id);
-                    if (Propagate(uc, i))
+                    prof::Bump(prof::CTR_CAR_PROP_TRIED);
+                    if (Propagate(uc, i)) {
+                        prof::Bump(prof::CTR_CAR_PROP_OK);
                         m_branching->Update(uc);
+                    }
                 }
             }
 
             // invariant check
-            if (IsInvariant(i + 1)) {
+            bool inv_holds = false;
+            {
+                prof::ScopedSpan inv_span(prof::Stage::BCAR_INVARIANT,
+                                          static_cast<uint32_t>(i + 1));
+                inv_holds = IsInvariant(i + 1);
+            }
+            if (inv_holds) {
                 LOG_L(m_log, 1, "Proof at frame ", i + 1);
                 LOG_L(m_log, 1, m_overSequence->FramesInfo());
                 m_overSequence->SetInvariantLevel(i);
-                OverSequenceRefine(i);
+                {
+                    prof::ScopedSpan refine_span(prof::Stage::BCAR_REFINE,
+                                                 static_cast<uint32_t>(i));
+                    OverSequenceRefine(i);
+                }
+                prof::IterationEnd(static_cast<uint32_t>(m_k),
+                                   m_overSequence->FrameIds(i).size(), true);
                 return true;
             }
         }
@@ -223,6 +281,8 @@ bool BCAR::Check() {
         LOG_L(m_log, 3, m_overSequence->FramesDetail());
         InitializeStartSolver();
 
+        prof::IterationEnd(static_cast<uint32_t>(m_k),
+                           m_overSequence->FrameIds(m_k).size(), false);
         m_k++;
         m_restart->ResetUcCounts();
         LOG_L(m_log, 2, "\nNew Frame Added");

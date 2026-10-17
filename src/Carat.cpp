@@ -5,6 +5,7 @@
 #include "Model.h"
 #include "WLChecker.h"
 #include "model/WLModel.h"
+#include "profiler/Profiler.h"
 #include "WitnessBuilder.h"
 #include <filesystem>
 #include <iostream>
@@ -36,8 +37,12 @@ bool Carat::LoadModel() {
     // load model
     try {
         if (IsBtor2Input(m_settings)) {
+            prof::ScopedSpan load_span(prof::Stage::MODEL_LOAD);
             m_wmodel = std::make_unique<WLModel>(m_settings, *m_log);
+            prof::ModelStat(prof::MSTAT_BTOR2_NODES,
+                            m_wmodel->SourceIR().Nodes().size());
         } else {
+            prof::ScopedSpan load_span(prof::Stage::MODEL_LOAD);
             m_model = std::make_unique<Model>(m_settings, *m_log);
         }
     } catch (const std::exception &error) {
@@ -59,6 +64,7 @@ bool Carat::LoadModel() {
 
     // create checker
     try {
+        prof::ScopedSpan checker_span(prof::Stage::MODEL_INIT_CHECKER);
         if (m_wmodel) {
             m_checker = std::make_unique<WLChecker>(
                 m_settings, *m_wmodel, *m_log);

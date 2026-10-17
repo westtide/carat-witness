@@ -1,4 +1,5 @@
 #include "Btor2Frontend.h"
+#include "Sha256.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -16,8 +17,12 @@ std::runtime_error Unsupported(const Btor2IRNode &node,
 } // namespace
 
 Btor2IR Btor2Frontend::LoadIR(const std::string &path) {
+    const std::string hash = Sha256::File(path);
     Btor2IR ir = Parse(path);
     Validate(ir);
+    if (Sha256::File(path) != hash)
+        throw std::runtime_error("BTOR2 source changed during parsing");
+    ir.BindSourceSha256(hash);
     return ir;
 }
 

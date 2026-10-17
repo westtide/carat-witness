@@ -181,6 +181,19 @@ bool ParseSettings(int argc, char **argv, Settings &settings) {
     app.add_flag("-t", settings.detailedTimers, "detailed timers")
         ->default_val(false);
 
+    app.add_option("--trace-socket", settings.traceSocket,
+                   "Live profiler: path of the carat-profiler daemon Unix socket")
+        ->type_name("PATH");
+
+    app.add_option("--trace-file", settings.traceFile,
+                   "Live profiler: write the binary trace to this file (offline mode or mirror)")
+        ->type_name("PATH");
+
+    app.add_option("--trace-level", settings.traceLevel,
+                   "Live profiler level: summary | detail")
+        ->check(CLI::IsMember({"summary", "detail"}))
+        ->default_val("summary");
+
     try {
         app.parse(argc, argv);
         settings.satSolveInDomain = !disableSatSolveInDomain;

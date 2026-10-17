@@ -6,6 +6,7 @@
 #include "ArraySimplifier.h"
 #include "WLSimulator.h"
 #include "Log.h"
+#include "profiler/Profiler.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -93,8 +94,15 @@ WLModel::~WLModel() = default;
 
 const Btor2IR &WLModel::PropertyIR() const {
     if (!m_propertyIr) {
-        auto property = m_disableCoi ? m_sourceIr : ReduceToPropertyCoi(m_sourceIr);
+        Btor2IR property;
+        {
+            prof::ScopedSpan coi_span(prof::Stage::MODEL_COI);
+            property = m_disableCoi ? m_sourceIr : ReduceToPropertyCoi(m_sourceIr);
+            prof::ModelStat(prof::MSTAT_BTOR2_COI_NODES,
+                            property.Nodes().size());
+        }
         if (property.HasArrays()) {
+            prof::ScopedSpan simplify_span(prof::Stage::MODEL_ARRAY_SIMPLIFY);
             m_arraySimplifier = std::make_unique<ArraySimplifier>(property);
             const auto &stats = m_arraySimplifier->Stats();
             LOG_L(m_log, 1, "word-level array simplification: comparisons=", stats.comparisonsBefore,
@@ -103,7 +111,12 @@ const Btor2IR &WLModel::PropertyIR() const {
             for (const auto &reason : stats.skippedRules)
                 LOG_L(m_log, 2, "word-level array simplification skipped rule: ", reason);
             property = m_arraySimplifier->IR();
-            if (!m_disableCoi) property = ReduceToPropertyCoi(property);
+            if (!m_disableCoi) {
+                prof::ScopedSpan recoi_span(prof::Stage::MODEL_COI);
+                property = ReduceToPropertyCoi(property);
+                prof::ModelStat(prof::MSTAT_BTOR2_COI_NODES,
+                                property.Nodes().size());
+            }
         }
         m_propertyIr = std::make_unique<Btor2IR>(std::move(property));
     }

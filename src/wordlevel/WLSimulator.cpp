@@ -57,10 +57,13 @@ class WLSimulator::Impl {
 
     explicit Impl(const Btor2IR &ir) : m_ir(ir) { Index(); }
 
-    WLSimulator::VerificationResult Verify(const WLTrace &trace) {
+    WLSimulator::VerificationResult Verify(const WLTrace &trace,
+                                           const WLSimulator::FrameCallback &onFrame) {
         WLSimulator::VerificationResult result;
         try {
-            Execute(trace, {}, WLSimulator::MissingChoices::Reject, true, nullptr);
+            WLSimulator::SimulationOptions options;
+            options.onFrame = onFrame;
+            Execute(trace, {}, WLSimulator::MissingChoices::Reject, true, &options);
             result.kind = VerificationKind::Confirmed;
             m_verificationNode = m_bad;
         } catch (const VerificationFailure &failure) {
@@ -387,10 +390,13 @@ class WLSimulator::Impl {
                     if (value.isArray) Fail(VerificationKind::Invalid, id, "observation requires a BV expression");
                     step.emplace(id, std::move(value.bits.value));
                 }
-                if (m_options && m_options->onFrame) {
-                    CurrentFrame frame(*this);
-                    m_options->onFrame(m_time, frame);
-                }
+            }
+            // A verification observer sees this same current-state/input frame
+            // and shares the property/next-expression cache. It cannot override
+            // values or turn a failed verification into a confirmed candidate.
+            if (m_options && m_options->onFrame) {
+                CurrentFrame frame(*this);
+                m_options->onFrame(m_time, frame);
             }
             if (m_time + 1 == m_candidateTrace->steps.size()) {
                 if (verify && !bad)
@@ -736,8 +742,8 @@ WLSimulator::WLSimulator(const Btor2IR &ir)
 WLSimulator::~WLSimulator() = default;
 
 WLSimulator::VerificationResult
-WLSimulator::Verify(const WLTrace &trace) {
-    return m_impl->Verify(trace);
+WLSimulator::Verify(const WLTrace &trace, const FrameCallback &onFrame) {
+    return m_impl->Verify(trace, onFrame);
 }
 
 WLSimulator::Execution WLSimulator::Simulate(const WLTrace &choices,

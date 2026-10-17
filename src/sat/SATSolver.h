@@ -6,6 +6,7 @@
 #include "MinicoreSolver.h"
 #include "MinisatSolver.h"
 #include "Model.h"
+#include "profiler/Profiler.h"
 #include <memory>
 
 namespace car {
@@ -120,6 +121,10 @@ class SATSolver {
 
     Var m_trueId;
     size_t m_fixedDomainSize;
+
+    // Live profiler instance identity (backend travels with every SAT event).
+    uint64_t m_profInstanceId = 0;
+    uint32_t m_profBackend = prof::BACKEND_UNKNOWN;
 };
 
 } // namespace car
