@@ -8,7 +8,8 @@ path does not require a separate BtorSim/VCD replay.
 
 ## Build
 
-Requires Git, CMake, Make, Clang/LLVM with LLD, and wget. The C++ sources use C++17.
+Requires Git, CMake, Make, Clang/LLVM with LLD, curl, and GCC/G++ on Linux.
+The C++ sources use C++17.
 The build commands are unchanged:
 
 ```bash

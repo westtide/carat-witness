@@ -4,6 +4,13 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)}"
 
+# Prefer the system toolchain over compiler wrappers injected into PATH.
+# Explicit caller choices still take precedence.
+if [[ "$(uname -s)" == Linux ]]; then
+    export CC="${CC:-/usr/bin/gcc}"
+    export CXX="${CXX:-/usr/bin/g++}"
+fi
+
 cd "$ROOT_DIR"
 
 # Use the URLs and pinned commits recorded by this parent checkout. Never
@@ -40,10 +47,8 @@ BTOR2TOOLS_DIR="$ROOT_DIR/deps/btor2tools"
 BOOLECTOR_LIB="$BTOR2TOOLS_DIR/deps/install/lib/libboolector.a"
 if [[ ! -f "$BOOLECTOR_LIB" ]]; then
     echo "[setup] building btor2tools dependencies"
-    (
-        cd "$BTOR2TOOLS_DIR"
-        ./setup-deps.sh
-    )
+    # Use pinned sources; the upstream helper deletes deps and follows branches.
+    "$ROOT_DIR/setup-btor2-deps.sh"
 fi
 
 echo "[setup] building btor2tools"

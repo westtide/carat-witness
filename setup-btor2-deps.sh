@@ -7,6 +7,9 @@ JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.logicalcpu
 if [[ "$(uname -s)" == Darwin ]]; then
     export CC="${CC:-/usr/bin/clang}"
     export CXX="${CXX:-/usr/bin/clang++}"
+elif [[ "$(uname -s)" == Linux ]]; then
+    export CC="${CC:-/usr/bin/gcc}"
+    export CXX="${CXX:-/usr/bin/g++}"
 fi
 
 # These are the bitblast-api version and its upstream dependency revisions.
