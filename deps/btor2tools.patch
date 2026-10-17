@@ -1,0 +1,336 @@
+diff --git a/src/btorsim/btorsim.cpp b/src/btorsim/btorsim.cpp
+index ec49b5c9151c3d783bbc6272d878b7223c8664ea..1fef784d5d2257d566600cfbf3b1e355f47dc851 100644
+--- a/src/btorsim/btorsim.cpp
++++ b/src/btorsim/btorsim.cpp
+@@ -1474,7 +1474,7 @@ parse_state_part (int64_t k)
+     if (k == 0)
+     {
+       Btor2Line *init = inits[state->id];
+-      if (init && nexts[state->id])
++      if (init)
+       {
+         msg (4, "init & next for state %" PRId64, state->id);
+         assert (init->nargs == 2);
+@@ -1492,15 +1492,18 @@ parse_state_part (int64_t k)
+         else
+         {
+           BtorSimBitVector *element;
+-          if (is_const_init)
++          if (tmp.type == BtorSimState::Type::BITVEC)
+           {
+-            assert (tmp.type == BtorSimState::Type::BITVEC);
++            // A vector initializes every cell of an array, including explicit
++            // indexed witness assignments to that initialized state.
+             element = btorsim_bv_copy (tmp.bv_state);
+           }
+           else
+           {
+             assert (tmp.type == BtorSimState::Type::ARRAY);
+-            element = tmp.array_state->check (idx);
++            element = is_const_init ? tmp.array_state->get_const_init ()
++                                    : tmp.array_state->read (idx);
++            if (!element) element = btorsim_bv_zero (val->width);
+           }
+           if (element)
+           {
+@@ -1537,8 +1540,9 @@ parse_state_part (int64_t k)
+         BtorSimBitVector *tmp =
+             is_const_init
+                 ? current_state[state->id].array_state->get_const_init ()
+-                : current_state[state->id].array_state->check (idx);
+-        if (tmp && btorsim_bv_compare (val, tmp))
++                : current_state[state->id].array_state->read (idx);
++        if (!tmp) tmp = btorsim_bv_zero (val->width);
++        if (btorsim_bv_compare (val, tmp))
+         {
+           parse_error ("incompatible assignment for state %" PRId64
+                        " id %" PRId64 " in time frame %" PRId64,
+@@ -1566,7 +1570,7 @@ parse_state_part (int64_t k)
+       else
+       {
+         tmp.array_state =
+-            current_state[state->id].array_state->write (idx, val);
++            current_state[state->id].array_state->write (idx, val, true);
+         btorsim_bv_free (idx);
+       }
+       update_current_state (state->id, tmp);
+@@ -1667,19 +1671,41 @@ parse_input_part (int64_t k)
+         parse_error ("expected array index assignment for input '%" PRId64 "'",
+                      input_pos);
+       }
+-      BtorSimBitVector *idx = btorsim_bv_char_to_bv (array_index.start);
++      const bool is_const_init = BTOR2_COUNT_STACK (array_index) == 2
++                                 && BTOR2_PEEK_STACK (array_index, 0) == '*';
++      Btor2Line *li =
++          btor2parser_get_line_by_id (model, input->sort.array.index);
++      Btor2Line *le =
++          btor2parser_get_line_by_id (model, input->sort.array.element);
++      if (!is_const_init && strlen (array_index.start) != li->sort.bitvec.width)
++      {
++        charno = index_columno;
++        parse_error ("expected index of width '%u'", li->sort.bitvec.width);
++      }
++      if (strlen (constant.start) != le->sort.bitvec.width)
++      {
++        charno = constant_columno;
++        parse_error ("expected element of width '%u'", le->sort.bitvec.width);
++      }
++      BtorSimBitVector *idx =
++          is_const_init ? nullptr : btorsim_bv_char_to_bv (array_index.start);
+       BtorSimBitVector *val = btorsim_bv_char_to_bv (constant.start);
+       lineno++;
+       charno = saved_charno;
+ 
+       if (!current_state[input->id].array_state)
+       {
+-        update_current_state (input->id,
+-                              new BtorSimArrayModel (idx->width, val->width));
++        update_current_state (
++            input->id, new BtorSimArrayModel (li->sort.bitvec.width,
++                                             le->sort.bitvec.width));
+       }
+       BtorSimArrayModel *am =
+-          current_state[input->id].array_state->write (idx, val);
++          is_const_init
++              ? current_state[input->id].array_state->set_const_init (val)
++              : current_state[input->id].array_state->write (idx, val, true);
+       update_current_state (input->id, am);
++      if (idx) btorsim_bv_free (idx);
++      btorsim_bv_free (val);
+     }
+   }
+ }
+diff --git a/src/btorsim/btorsimam.cpp b/src/btorsim/btorsimam.cpp
+index 9103d84b90f855d2a02a7e6a89a02ffc3647db96..095b912cc6ca996bf48eac361346cbb4f97afd38 100644
+--- a/src/btorsim/btorsimam.cpp
++++ b/src/btorsim/btorsimam.cpp
+@@ -58,33 +58,45 @@ BtorSimBitVector*
+ BtorSimArrayModel::read (const BtorSimBitVector* index)
+ {
+   assert (index->width == index_width);
++  if (data.empty () && (const_init || !random_seed))
++    return const_init ? btorsim_bv_copy (const_init)
++                      : btorsim_bv_new (element_width);
+   std::string i = btorsim_bv_to_string (index);
+-  if (!data[i])
+-  {
+-    if (const_init)
+-      data[i] = btorsim_bv_copy (const_init);
+-    else if (random_seed)
+-      data[i] = btorsim_bv_uint64_to_bv (
+-          get_random_init (btorsim_bv_to_uint64 (index)), element_width);
+-    else
+-      data[i] = btorsim_bv_new (element_width);
+-  }
++  auto entry = data.find (i);
++  if (entry != data.end ()) return btorsim_bv_copy (entry->second);
++  // A known default is already part of the total array value. Do not cache
++  // redundant cells: each subsequent functional write would copy them again.
++  if (const_init) return btorsim_bv_copy (const_init);
++  if (!random_seed) return btorsim_bv_new (element_width);
++  // Keep the existing random-mode access cache and generated-value path.
++  data[i] = btorsim_bv_uint64_to_bv (
++      get_random_init (btorsim_bv_to_uint64 (index)), element_width);
+   return btorsim_bv_copy (data[i]);
+ }
+ 
+ BtorSimArrayModel*
+ BtorSimArrayModel::write (const BtorSimBitVector* index,
+-                          const BtorSimBitVector* element)
++                          const BtorSimBitVector* element,
++                          bool preserve_default)
+ {
+   assert (index->width == index_width);
+   assert (element->width == element_width);
++  // Use the original array's default/seed; copy() has a separate pre-existing
++  // random-seed limitation. Never canonicalize random fallback values here.
++  bool is_default = const_init ? !btorsim_bv_compare (element, const_init)
++                               : !random_seed && btorsim_bv_is_zero (element);
++  // A no-op write to a uniform known-default array does not need an index key.
++  if (!preserve_default && is_default && data.empty ()) return copy ();
+   std::string i          = btorsim_bv_to_string (index);
+   BtorSimArrayModel* res = copy ();
+-  if (res->data[i])
++  auto entry = res->data.find (i);
++  if (entry != res->data.end ())
+   {
+-    btorsim_bv_free (res->data[i]);
++    btorsim_bv_free (entry->second);
++    res->data.erase (entry);
+   }
+-  res->data[i] = btorsim_bv_copy (element);
++  if (preserve_default || !is_default)
++    res->data[i] = btorsim_bv_copy (element);
+   return res;
+ }
+ 
+@@ -148,26 +160,37 @@ data_is_subset (const BtorSimArrayModel& self, const BtorSimArrayModel& other)
+ bool
+ BtorSimArrayModel::operator== (const BtorSimArrayModel& other) const
+ {
+-  if (data.size () != ((size_t) 1) << index_width)
+-  // if all elements were accessed, init values are irrelevant,
+-  // otherwise they must match
++  assert (index_width == other.index_width);
++  assert (element_width == other.element_width);
++  // Check explicit cells in both directions against the other array's actual
++  // fallback. This also covers disjoint overrides whose union is the domain.
++  if (!data_is_subset (*this, other) || !data_is_subset (other, *this))
++    return false;
++
++  bool same_default;
++  if (const_init && other.const_init)
++    same_default = !btorsim_bv_compare (const_init, other.const_init);
++  else if (!const_init && !other.const_init)
++    same_default = random_seed == other.random_seed;
++  else
+   {
+-    if (!const_init != !other.const_init)
+-      return false;  // one initialized but not the other
+-    if (const_init)
+-    {
+-      if (btorsim_bv_compare (const_init, other.const_init) != 0) return false;
+-    }
+-    else
+-    {
+-      if (random_seed != other.random_seed) return false;
+-      // when randomize mode is off, two unrelated uninitialized arrays will
+-      // compare equal, but with randomize they may not. this is ok because
+-      // both are within the behavior allowed by model and witness.
+-    }
++    // Checking mode represents an unspecified cell as zero. An explicit zero
++    // default and that implicit default are the same total array value.
++    const BtorSimArrayModel& initialized = const_init ? *this : other;
++    const BtorSimArrayModel& uninitialized = const_init ? other : *this;
++    same_default = !uninitialized.random_seed
++                   && btorsim_bv_is_zero (initialized.const_init);
+   }
+-  // init values match; check accessed data is same
+-  return data_is_subset (*this, other) && data_is_subset (other, *this);
++  if (same_default) return true;
++
++  // Defaults are irrelevant only when every index is explicitly covered by at
++  // least one side. Count the sparse union without enumerating the domain or
++  // shifting by an address width that is at least the machine word size.
++  if (index_width >= sizeof (size_t) * 8) return false;
++  size_t covered = data.size ();
++  for (const auto& entry : other.data)
++    if (data.find (entry.first) == data.end ()) ++covered;
++  return covered == (size_t (1) << index_width);
+ }
+ 
+ bool
+diff --git a/src/btorsim/btorsimam.h b/src/btorsim/btorsimam.h
+index 19d1ed1e514edc3fbe74dfa63ed06892b49b8093..bf3305e674ac4e7cebf4369eaca42cc6a3e6da01 100644
+--- a/src/btorsim/btorsimam.h
++++ b/src/btorsim/btorsimam.h
+@@ -35,19 +35,11 @@ struct BtorSimArrayModel
+    * statement */
+   BtorSimBitVector* const_init = nullptr;
+ 
+-  /* Only the values of previously accessed memory elements are stored. Indexes
+-   * are represented as strings of '0' and '1' because they can represent
+-   * arbitrarily large vectors, have a well-defined length, and do not require
+-   * custom comparison functions. If a not previously accessed element is read,
+-   * an entry is created and populated with the first existing value of:
+-   * - const_init (if the entire array has been initialized with a vector)
+-   * - a reproducible pseudo-random value provided by get_random_init based on
+-   * index value and random_seed (if non-zero, i.e. when randomize mode is
+-   * enabled)
+-   * - zero.
+-   * It is important to populate on read and not only on write so that a full
+-   * account of all accessed memory elements and their values is shown in the
+-   * trace.
++  /* Sparse overrides of the known default (const_init, or implicit zero).
++   * Reads of that default do not insert cells, and writes of it erase an
++   * existing override. In random mode, preserve accessed-cell caching and all
++   * explicit writes; a generated fallback is not a uniform known default.
++   * Indexes are strings of '0' and '1' to support arbitrarily wide indices.
+    */
+   std::unordered_map<std::string, BtorSimBitVector*> data;
+ 
+@@ -76,17 +68,20 @@ struct BtorSimArrayModel
+    * take ownership */
+   BtorSimArrayModel* set_const_init (const BtorSimBitVector* init) const;
+ 
+-  /* obtain a copy of the element at index, create entry if not previously
+-   * accessed and initialize appropriately */
++  /* obtain a copy of the element at index; only random-mode fallback reads
++   * create an accessed-cell entry */
+   BtorSimBitVector* read (const BtorSimBitVector* index);
+ 
+   /* return a copy of the array with the element written at index (copies the
+-   * *element argument vector, does not take ownership) */
++   * *element argument vector, does not take ownership). Witness parsing keeps
++   * explicit cells even when equal to the current fallback: a later [*] row
++   * may replace that fallback, without changing earlier indexed assignments. */
+   BtorSimArrayModel* write (const BtorSimBitVector* index,
+-                            const BtorSimBitVector* element);
++                            const BtorSimBitVector* element,
++                            bool preserve_default = false);
+ 
+-  /* obtain a copy of the element at index only if it was already previously
+-   * accessed, return null otherwise */
++  /* obtain a copy of an explicit sparse/cache entry; return null for an
++   * implicit known-default cell or an unaccessed random-mode cell */
+   BtorSimBitVector* check (const BtorSimBitVector* index) const;
+ 
+   /* return a copy of the array */
+diff --git a/src/btorsim/btorsimvcd.cpp b/src/btorsim/btorsimvcd.cpp
+index 9fd8738c631af66dd43791047bc51bd2b9c0fd4a..6540a92f6e04656ab972c959678f334554a2cbc3 100644
+--- a/src/btorsim/btorsimvcd.cpp
++++ b/src/btorsim/btorsimvcd.cpp
+@@ -335,6 +335,7 @@ BtorSimVCDWriter::add_value_change (int64_t k, int64_t id, BtorSimState state)
+         update_time (k);
+         for (auto it : state.array_state->data)
+         {
++          am_observed_indices[id].insert (it.first);
+           if (!prev_value[id].array_state
+               || prev_value[id].array_state->data.find (it.first)
+                      == prev_value[id].array_state->data.end ()
+@@ -347,6 +348,24 @@ BtorSimVCDWriter::add_value_change (int64_t k, int64_t id, BtorSimState state)
+             value_changes.push_back (sval + get_am_identifier (id, it.first));
+           }
+         }
++        // Canonical sparse arrays may remove a previously displayed override.
++        // Emit its actual known fallback, including after later default changes.
++        // Random fallbacks are not uniform; preserve their existing trace path.
++        if (!am_observed_indices[id].empty ()
++            && (state.array_state->const_init || !state.array_state->random_seed))
++        {
++          BtorSimBitVector* fallback = state.array_state->get_const_init ();
++          if (!fallback)
++            fallback = btorsim_bv_zero (state.array_state->element_width);
++          std::string sval = fallback->width > 1 ? "b" : "";
++          sval += btorsim_bv_to_string (fallback);
++          if (fallback->width > 1) sval += " ";
++          for (const auto& index : am_observed_indices[id])
++            if (state.array_state->data.find (index)
++                == state.array_state->data.end ())
++              value_changes.push_back (sval + get_am_identifier (id, index));
++          btorsim_bv_free (fallback);
++        }
+         prev_value[id].update (state.array_state->copy ());
+       }
+     }
+diff --git a/src/btorsim/btorsimvcd.h b/src/btorsim/btorsimvcd.h
+index 51493bea5655cbe3f008a6a2f12a3fc0fdee9c6e..7f6a65b196344fadf6b54964445b23fd3f7270dd 100644
+--- a/src/btorsim/btorsimvcd.h
++++ b/src/btorsim/btorsimvcd.h
+@@ -15,6 +15,7 @@
+ #include <cinttypes>
+ #include <fstream>
+ #include <map>
++#include <set>
+ #include <string>
+ #include <vector>
+ 
+@@ -55,6 +56,8 @@ class BtorSimVCDWriter
+       bv_identifiers;  // identifiers assigned to vector states
+   std::map<std::pair<int64_t, std::string>, std::string>
+       am_identifiers;  // identifiers assigned to array state elements
++  std::map<int64_t, std::set<std::string>>
++      am_observed_indices;  // binary indices of all previously emitted cells
+   std::vector<std::string>
+       value_changes;  // contents of VCD file, one entry per line (in memory as
+                       // header can only be written at end of simulation)
