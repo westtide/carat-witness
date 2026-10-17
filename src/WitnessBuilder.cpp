@@ -5,7 +5,7 @@
 #include "Model.h"
 #include "WLTrace.h"
 #include "WLSimulator.h"
-#include "ObservationSidecar.h"
+#include "Btor2Witness.h"
 #include "model/WLModel.h"
 
 #include <algorithm>
@@ -235,10 +235,9 @@ bool WitnessBuilder::WriteBtor2Counterexample(
     }
 
     std::string error;
-    if (!WriteObservedCounterexample(m_wlModel->SourceIR(), trace,
-                                     m_settings.aigFilePath,
-                                     GetBtor2CounterexamplePath(), error)) {
-        LOG_L(m_log, 0, "WitnessBuilder: SourceIR observation export failed: ", error);
+    if (!car::WriteBtor2Counterexample(m_wlModel->SourceIR(), trace,
+                                       GetBtor2CounterexamplePath(), error)) {
+        LOG_L(m_log, 0, "WitnessBuilder: SourceIR counterexample export failed: ", error);
         return false;
     }
     return true;

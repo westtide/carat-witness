@@ -94,7 +94,7 @@ set(SRCS
     src/wordlevel/model/WLModel.cpp
     src/wordlevel/model/PackageResize.cpp
     src/wordlevel/WLSimulator.cpp
-    src/wordlevel/ObservationSidecar.cpp
+    src/wordlevel/Btor2Witness.cpp
     src/wordlevel/WLChecker.cpp
     src/wordlevel/WLCEGAR.cpp
     src/wordlevel/MemoryBMC.cpp
@@ -212,12 +212,12 @@ message(STATUS "CXX compiler: ${CMAKE_CXX_COMPILER}")
 
 # Concrete replay/export only: no model-checking algorithm or SAT backend.
 add_executable(carat-replay
-    tools/cex_observations.cpp
+    tools/cex_replay.cpp
     src/frontend/btor2/Btor2Frontend.cpp
     src/wordlevel/model/Btor2IR.cpp
     src/wordlevel/BitVector.cpp
     src/wordlevel/WLSimulator.cpp
-    src/wordlevel/ObservationSidecar.cpp
+    src/wordlevel/Btor2Witness.cpp
     deps/btor2tools/src/btor2parser/btor2parser.c
     deps/btor2tools/src/btorsim/btorsimbv.c
     deps/btor2tools/src/btorsim/btorsimrng.c)

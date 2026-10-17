@@ -93,7 +93,7 @@ CheckResult Carat::Prove() {
             m_wmodel
                 ? WitnessBuilder(m_settings, *m_log, *m_wmodel)
                 : WitnessBuilder(m_settings, *m_log, *m_model);
-        if (res == CheckResult::Safe && m_checker->SupportsWitness()) {
+        if (res == CheckResult::Safe && !m_wmodel && m_checker->SupportsWitness()) {
             witness_builder.BeginWitness();
             m_model->RefineWitnessPropertyLit(witness_builder);
             m_checker->RefineWitnessPropertyLit(witness_builder);
@@ -101,14 +101,20 @@ CheckResult Carat::Prove() {
                 LOG_L(*m_log, 1, "Failed to write safe witness.");
             }
         } else if (res == CheckResult::Unsafe) {
-            bool written = m_wmodel
-                               ? witness_builder.WriteCounterexample(
-                                     static_cast<WLChecker &>(*m_checker)
-                                         .GetTrace())
-                               : witness_builder.WriteCounterexample(
-                                     m_checker->GetCexTrace());
-            if (!written) {
-                LOG_L(*m_log, 1, "Failed to write counterexample witness.");
+            try {
+                bool written = m_wmodel
+                                   ? witness_builder.WriteCounterexample(
+                                         static_cast<WLChecker &>(*m_checker)
+                                             .GetTrace())
+                                   : witness_builder.WriteCounterexample(
+                                         m_checker->GetCexTrace());
+                if (!written) {
+                    LOG_L(*m_log, 0, "Failed to write counterexample witness.");
+                }
+            } catch (const std::exception &error) {
+                // Keep the checker verdict visible even when recovery/export
+                // fails. The competition wrapper separately requires a witness.
+                LOG_L(*m_log, 0, "Counterexample export failed: ", error.what());
             }
         }
     }
