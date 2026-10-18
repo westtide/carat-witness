@@ -1,10 +1,10 @@
 # Carat for C2Btor Witness
 
-This version of Carat is developed specifically for the **C2Btor witness
-pipeline**. It checks concrete counterexamples against the original input BTOR2
-model and exports counterexamples plus execution observations for Python to
-recover C executions and generate SV-COMP YAML 2.1 witnesses. The normal recovery
-path does not require a separate BtorSim/VCD replay.
+This version of Carat supports the **C2Btor witness pipeline**. It checks concrete
+counterexamples against the original input BTOR2 model and exports a standard
+BTOR2 witness after one model-checking run. C2Btor's Python recovery replays the
+original model with BtorSim and uses its source map to generate an SV-COMP YAML
+2.1 witness.
 
 ## Build
 
@@ -61,15 +61,14 @@ For an Unsafe result with a confirmed counterexample, the output is:
 
 ```text
 witness-out/model.btor2.cexb
-witness-out/model.btor2.cexb.obs.jsonl
 ```
 
-The `.cexb` contains concrete bit-vector and sparse-array assignments. Its
-`.obs.jsonl` companion contains observations from the internal confirmation,
-bound to the model and counterexample by hashes. Keep both files together.
-Python uses them with the C2Btor model and source map to generate `witness.yml`;
-Carat itself does not write the C-level YAML witness. Safe results use the
-existing Python dummy correctness-witness path.
+The `.cexb` contains standard `sat`, bad-property, state-frame and input-frame
+sections with concrete bit-vector and sparse-array assignments. Python uses it
+with the original C2Btor model and source map to generate `witness.yml`; Carat
+itself does not write the C-level YAML witness. Safe results retain the basic
+Python correctness-witness path with invariant `1`; this is not an independently
+validated proof.
 
 Run `./build/carat -h` to see all available options.
 
